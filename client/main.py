@@ -35,7 +35,7 @@ class SimpleGameClient:
         self.clock = pygame.time.Clock()
         self.last_data = {}
         self.current_player_id = None
-        self.server_url = "ws://192.168.0.106:8765"
+        self.server_url = "ws://192.168.94.1:8765"
 
     def init_display(self):
         """Initialize display"""
