@@ -18,7 +18,7 @@ class GameRoom:
     ROWS = 15
     COLS = 19
     PLAYER_SPEED = 0.2
-    GHOST_SPEED = 0.08
+    GHOST_SPEED = 0.15  # Further increased for more visible movement
     PLAYER_RADIUS = 15
     GHOST_RADIUS = 15
     PELLET_RADIUS = 4
@@ -86,12 +86,22 @@ class GameRoom:
                 if abs(self.y - grid_y) < GameRoom.GRID_SNAP_THRESHOLD:
                     self.y = float(grid_y)
         
-        return [
-            Ghost(9, 7, "aggressive", "red"),
-            Ghost(8, 9, "patrol", "orange"), 
-            Ghost(10, 9, "ambush", "purple"),
-            Ghost(9, 8, "random", "green")
+        import random
+        ghosts = [
+            Ghost(9 + random.uniform(-0.2, 0.2), 7 + random.uniform(-0.2, 0.2), "aggressive", "red"),
+            Ghost(8 + random.uniform(-0.2, 0.2), 9 + random.uniform(-0.2, 0.2), "patrol", "orange"), 
+            Ghost(10 + random.uniform(-0.2, 0.2), 9 + random.uniform(-0.2, 0.2), "ambush", "purple"),
+            Ghost(9 + random.uniform(-0.2, 0.2), 8 + random.uniform(-0.2, 0.2), "random", "green")
         ]
+        
+        # Initialize ghosts with proper starting directions
+        for i, ghost in enumerate(ghosts):
+            # Give each ghost a different starting direction
+            directions = [(1, 0), (-1, 0), (0, 1), (0, -1)]  # right, left, down, up
+            ghost.dx, ghost.dy = directions[i % 4]
+            ghost.mode_timer = i * 10  # Stagger their behavior updates
+        
+        return ghosts
     
     def is_full(self):
         """Check if room is at maximum capacity"""
@@ -251,95 +261,112 @@ class GameRoom:
                     player["power"] = self.POWER_TIME
     
     def _update_ghosts(self):
-        """Update ghost AI and movement"""
+        """Update ghost AI and movement - Fixed movement system"""
         for ghost in self.ghosts:
             self._update_ghost_behavior(ghost)
             
+            # Simple but effective movement
             new_x = ghost.x + ghost.dx * self.GHOST_SPEED
             new_y = ghost.y + ghost.dy * self.GHOST_SPEED
             
-            new_x = max(0.4, min(self.COLS - 0.4, new_x))
-            new_y = max(0.4, min(self.ROWS - 0.4, new_y))
+            # Ensure ghosts stay within bounds
+            new_x = max(0.5, min(self.COLS - 0.5, new_x))
+            new_y = max(0.5, min(self.ROWS - 0.5, new_y))
             
+            # Check if movement is valid
             if self.can_move(new_x, new_y):
                 ghost.x, ghost.y = new_x, new_y
             else:
-                valid_dirs = self._get_valid_directions(ghost.x, ghost.y)
+                # If blocked, choose a new random direction
+                valid_dirs = self._get_valid_directions_simple(ghost.x, ghost.y)
                 if valid_dirs:
-                    ghost.dx, ghost.dy, _ = random.choice(valid_dirs)
+                    ghost.dx, ghost.dy = random.choice(valid_dirs)
+                    # Try moving in new direction immediately
+                    new_x = ghost.x + ghost.dx * self.GHOST_SPEED
+                    new_y = ghost.y + ghost.dy * self.GHOST_SPEED
+                    new_x = max(0.5, min(self.COLS - 0.5, new_x))
+                    new_y = max(0.5, min(self.ROWS - 0.5, new_y))
+                    if self.can_move(new_x, new_y):
+                        ghost.x, ghost.y = new_x, new_y
     
     def _update_ghost_behavior(self, ghost):
-        """Enhanced ghost AI"""
+        """Simplified ghost AI that ensures movement"""
         ghost.mode_timer += 1
         ghost.behavior_change_timer += 1
-        ghost.snap_to_grid()
         
-        ghost.last_positions.append((ghost.x, ghost.y))
+        # Ensure ghosts always have a direction
+        if ghost.dx == 0 and ghost.dy == 0:
+            ghost.dx = 1  # Start moving right
+            ghost.dy = 0
         
-        if not self.players:
-            return
+        # Force movement check - if ghost hasn't moved in 5 updates, pick new direction
+        if not hasattr(ghost, 'last_position'):
+            ghost.last_position = (ghost.x, ghost.y)
+            ghost.stuck_counter = 0
         
-        alive_players = [p for p in self.players.values() if not p["dead"]]
-        if not alive_players:
-            return
-        
-        closest_player = min(alive_players, 
-                           key=lambda p: self._distance(ghost.x, ghost.y, p["x"], p["y"]))
-        
-        players_powered = any(p.get("power", 0) > 0 for p in alive_players)
-        
-        if ghost.behavior_change_timer > random.randint(60, 180):
-            ghost.behavior_change_timer = 0
-            behaviors = ["aggressive", "patrol", "ambush", "random", "confused"]
-            ghost.current_behavior = random.choice(behaviors)
-            ghost.randomness_factor = random.uniform(0.4, 0.9)
-        
-        if random.random() < ghost.randomness_factor:
-            ghost.current_behavior = "random"
-        
-        if players_powered:
-            if random.random() < 0.7:
-                corners = [(1, 1), (17, 1), (17, 13), (1, 13)]
-                target = min(corners, key=lambda c: self._distance(ghost.x, ghost.y, c[0], c[1]))
-                target_x, target_y = target
-            else:
-                target_x = random.randint(1, self.COLS-2)
-                target_y = random.randint(1, self.ROWS-2)
+        current_pos = (round(ghost.x, 2), round(ghost.y, 2))
+        if current_pos == ghost.last_position:
+            ghost.stuck_counter += 1
         else:
-            if ghost.current_behavior == "aggressive":
-                if random.random() < 0.8:
-                    target_x, target_y = closest_player["x"], closest_player["y"]
-                else:
-                    target_x = random.randint(1, self.COLS-2)
-                    target_y = random.randint(1, self.ROWS-2)
-            else:
-                target_x = random.randint(1, self.COLS-2)
-                target_y = random.randint(1, self.ROWS-2)
+            ghost.stuck_counter = 0
+            ghost.last_position = current_pos
         
-        # Simple movement towards target
-        if ghost.mode_timer % random.randint(8, 20) == 0:
-            valid_dirs = self._get_valid_directions(ghost.x, ghost.y)
+        # If stuck for too long, force a direction change
+        if ghost.stuck_counter > 5:
+            valid_dirs = self._get_valid_directions_simple(ghost.x, ghost.y)
             if valid_dirs:
-                if random.random() < 0.7:
-                    best_dir = None
-                    best_dist = float('inf')
-                    
-                    for dx, dy, direction in valid_dirs:
-                        test_x = ghost.x + dx * self.GHOST_SPEED
-                        test_y = ghost.y + dy * self.GHOST_SPEED
-                        dist = self._distance(test_x, test_y, target_x, target_y)
+                ghost.dx, ghost.dy = random.choice(valid_dirs)
+                ghost.stuck_counter = 0
+            else:
+                # If no valid directions, try to move in any direction slightly
+                ghost.dx = random.choice([-1, 1])
+                ghost.dy = random.choice([-1, 1])
+        
+        # Change direction more frequently for better movement visibility
+        if ghost.mode_timer % random.randint(20, 80) == 0:  # Change direction every 1-4 seconds
+            valid_dirs = self._get_valid_directions_simple(ghost.x, ghost.y)
+            
+            if valid_dirs:
+                # Find target if players exist
+                target_x, target_y = ghost.x, ghost.y
+                if self.players:
+                    alive_players = [p for p in self.players.values() if not p["dead"]]
+                    if alive_players:
+                        closest_player = min(alive_players, 
+                                           key=lambda p: self._distance(ghost.x, ghost.y, p["x"], p["y"]))
                         
-                        if dist < best_dist:
-                            best_dist = dist
-                            best_dir = (dx, dy)
+                        players_powered = any(p.get("power", 0) > 0 for p in alive_players)
+                        
+                        if players_powered:
+                            # Run away from players when they have power
+                            target_x = ghost.x + (ghost.x - closest_player["x"])
+                            target_y = ghost.y + (ghost.y - closest_player["y"])
+                        else:
+                            # Chase players normally
+                            if random.random() < 0.6:  # 60% chance to chase
+                                target_x, target_y = closest_player["x"], closest_player["y"]
+                
+                # Choose best direction towards target
+                best_dir = None
+                best_dist = float('inf')
+                
+                for dx, dy in valid_dirs:
+                    test_x = ghost.x + dx
+                    test_y = ghost.y + dy
+                    dist = self._distance(test_x, test_y, target_x, target_y)
                     
-                    if best_dir:
-                        ghost.dx, ghost.dy = best_dir
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_dir = (dx, dy)
+                
+                if best_dir:
+                    ghost.dx, ghost.dy = best_dir
                 else:
-                    ghost.dx, ghost.dy, _ = random.choice(valid_dirs)
+                    # Fallback: pick any valid direction
+                    ghost.dx, ghost.dy = random.choice(valid_dirs)
     
     def _get_valid_directions(self, x, y):
-        """Get valid movement directions"""
+        """Get valid movement directions (legacy)"""
         directions = []
         moves = [(-1, 0, "LEFT"), (1, 0, "RIGHT"), (0, -1, "UP"), (0, 1, "DOWN")]
         
@@ -348,6 +375,32 @@ class GameRoom:
             new_y = y + dy * self.GHOST_SPEED * 2
             if self.can_move(new_x, new_y):
                 directions.append((dx, dy, direction))
+        
+        return directions
+    
+    def _get_grid_directions(self, grid_x, grid_y):
+        """Get valid grid-based directions for ghosts"""
+        directions = []
+        moves = [(-1, 0, "LEFT"), (1, 0, "RIGHT"), (0, -1, "UP"), (0, 1, "DOWN")]
+        
+        for dx, dy, direction in moves:
+            new_x = grid_x + dx
+            new_y = grid_y + dy
+            if self.can_move(new_x, new_y):
+                directions.append((dx, dy, direction))
+        
+        return directions
+    
+    def _get_valid_directions_simple(self, x, y):
+        """Get valid movement directions for ghosts (simplified)"""
+        directions = []
+        moves = [(-1, 0), (1, 0), (0, -1), (0, 1)]  # LEFT, RIGHT, UP, DOWN
+        
+        for dx, dy in moves:
+            test_x = x + dx * self.GHOST_SPEED * 3  # Look ahead a bit
+            test_y = y + dy * self.GHOST_SPEED * 3
+            if self.can_move(test_x, test_y):
+                directions.append((dx, dy))
         
         return directions
     

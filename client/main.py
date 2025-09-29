@@ -11,22 +11,24 @@ PLAYER_RADIUS = 15
 GHOST_RADIUS = 15
 PELLET_RADIUS = 4
 
-# Simple, reliable colors
+# Classic Pac-Man colors
 COLORS = {
     'background': (0, 0, 0),
-    'wall': (0, 0, 255),
-    'pellet': (255, 255, 0),
-    'power_pellet': (255, 255, 255),
-    'player': (255, 255, 0),
-    'player_dead': (100, 100, 0),
-    'ghost_red': (255, 0, 0),
-    'ghost_orange': (255, 165, 0),
-    'ghost_purple': (255, 0, 255),
-    'ghost_green': (0, 255, 0),
+    'wall': (0, 0, 255),         # Classic blue walls
+    'pellet': (255, 255, 0),     # Yellow pellets
+    'power_pellet': (255, 255, 255),  # White power pellets
+    'player': (255, 255, 0),     # Classic yellow Pac-Man
+    'player_dead': (128, 128, 128),   # Gray when dead
+    'ghost_red': (255, 0, 0),         # Blinky (red)
+    'ghost_orange': (255, 184, 82),   # Clyde (orange) - more authentic orange
+    'ghost_purple': (255, 184, 255),  # Sue (purple/pink) - lighter pink
+    'ghost_green': (0, 255, 0),       # Inky (cyan/green)
+    'ghost_blue': (0, 255, 255),      # Alternative blue ghost
     'ui_text': (255, 255, 255),
-    'ui_background': (50, 50, 50),
+    'ui_background': (0, 0, 50),      # Dark blue UI background
     'death_overlay': (255, 0, 0),
-    'grid_line': (50, 50, 50)
+    'grid_line': (0, 0, 100),         # Darker blue grid lines
+    'maze_border': (0, 0, 200)        # Brighter blue for maze borders
 }
 
 class SimpleGameClient:
@@ -56,38 +58,51 @@ class SimpleGameClient:
             return False
 
     def draw_maze(self, surface, maze):
-        """Draw simple maze"""
+        """Draw classic Pac-Man style maze"""
         for y, row in enumerate(maze):
             for x, cell in enumerate(row):
                 px, py = x * CELL_SIZE, y * CELL_SIZE
+                center_x = px + CELL_SIZE // 2
+                center_y = py + CELL_SIZE // 2
                 
                 if cell == 1:  # Wall
-                    pygame.draw.rect(surface, COLORS['wall'], (px, py, CELL_SIZE, CELL_SIZE))
+                    # Draw wall with rounded corners for classic look
+                    wall_rect = pygame.Rect(px + 2, py + 2, CELL_SIZE - 4, CELL_SIZE - 4)
+                    pygame.draw.rect(surface, COLORS['wall'], wall_rect)
+                    # Add border effect
+                    pygame.draw.rect(surface, COLORS['maze_border'], wall_rect, 2)
                     
                 elif cell == 2:  # Regular pellet
-                    center_x = px + CELL_SIZE // 2
-                    center_y = py + CELL_SIZE // 2
+                    # Draw small yellow pellet
                     pygame.draw.circle(surface, COLORS['pellet'], (center_x, center_y), PELLET_RADIUS)
+                    # Add slight glow effect
+                    pygame.draw.circle(surface, (255, 255, 100), (center_x, center_y), PELLET_RADIUS - 1)
                     
                 elif cell == 3:  # Power pellet
-                    center_x = px + CELL_SIZE // 2
-                    center_y = py + CELL_SIZE // 2
-                    radius = PELLET_RADIUS * 2
-                    pygame.draw.circle(surface, COLORS['power_pellet'], (center_x, center_y), radius)
+                    # Draw large pulsing power pellet
+                    pulse = int(abs(math.sin(time.time() * 6)) * 3) + PELLET_RADIUS * 2
+                    pygame.draw.circle(surface, COLORS['power_pellet'], (center_x, center_y), pulse)
+                    # Inner glow
+                    pygame.draw.circle(surface, (255, 255, 200), (center_x, center_y), pulse - 2)
 
     def draw_player(self, surface, player_data, player_id, is_current):
-        """Draw simple player"""
+        """Draw authentic Pac-Man with mouth animation"""
         x = int(player_data['x'] * CELL_SIZE + CELL_SIZE // 2)
         y = int(player_data['y'] * CELL_SIZE + CELL_SIZE // 2)
         
         if player_data['dead']:
-            # Dead player (gray)
+            # Dead player - draw X eyes
             pygame.draw.circle(surface, COLORS['player_dead'], (x, y), PLAYER_RADIUS)
+            # Draw X for dead eyes
+            pygame.draw.line(surface, (255, 255, 255), (x-8, y-8), (x-2, y-2), 2)
+            pygame.draw.line(surface, (255, 255, 255), (x-2, y-8), (x-8, y-2), 2)
+            pygame.draw.line(surface, (255, 255, 255), (x+2, y-8), (x+8, y-2), 2)
+            pygame.draw.line(surface, (255, 255, 255), (x+8, y-8), (x+2, y-2), 2)
             return
         
         # Player colors
         player_colors = [
-            (255, 255, 0),   # Yellow
+            (255, 255, 0),   # Yellow (classic Pac-Man)
             (0, 255, 255),   # Cyan
             (255, 0, 255),   # Magenta
             (0, 255, 0)      # Green
@@ -99,19 +114,74 @@ class SimpleGameClient:
         if is_current:
             pygame.draw.circle(surface, (255, 255, 255), (x, y), PLAYER_RADIUS + 3, 2)
         
-        # Player body
-        pygame.draw.circle(surface, color, (x, y), PLAYER_RADIUS)
-        
         # Power mode glow
         if player_data.get('power', 0) > 0:
-            pygame.draw.circle(surface, (255, 255, 255), (x, y), PLAYER_RADIUS + 5, 2)
+            pygame.draw.circle(surface, (255, 255, 255), (x, y), PLAYER_RADIUS + 8, 3)
         
-        # Eyes
-        pygame.draw.circle(surface, (0, 0, 0), (x - 5, y - 3), 2)
-        pygame.draw.circle(surface, (0, 0, 0), (x + 5, y - 3), 2)
+        # Draw Pac-Man with mouth animation
+        self._draw_pacman(surface, x, y, color, player_data.get('direction', 'RIGHT'), 
+                         int(time.time() * 10) % 2 == 0)  # Mouth animation
+    
+    def _draw_pacman(self, surface, x, y, color, direction, mouth_open):
+        """Draw authentic Pac-Man with mouth facing the movement direction"""
+        radius = PLAYER_RADIUS
+        
+        if not mouth_open:
+            # Closed mouth - draw full circle
+            pygame.draw.circle(surface, color, (x, y), radius)
+            # Draw eye
+            eye_x, eye_y = x, y - 4
+            pygame.draw.circle(surface, (0, 0, 0), (eye_x, eye_y), 2)
+        else:
+            # Open mouth - draw arc with mouth opening
+            mouth_angle = math.pi / 3  # 60 degree mouth opening
+            
+            # Calculate angles based on direction
+            if direction == "RIGHT":
+                start_angle = mouth_angle / 2
+                end_angle = 2 * math.pi - mouth_angle / 2
+                eye_x, eye_y = x - 2, y - 6
+            elif direction == "LEFT":
+                start_angle = math.pi - mouth_angle / 2
+                end_angle = math.pi + mouth_angle / 2
+                eye_x, eye_y = x + 2, y - 6
+            elif direction == "UP":
+                start_angle = 3 * math.pi / 2 - mouth_angle / 2
+                end_angle = 3 * math.pi / 2 + mouth_angle / 2
+                eye_x, eye_y = x + 4, y + 2
+            elif direction == "DOWN":
+                start_angle = math.pi / 2 - mouth_angle / 2
+                end_angle = math.pi / 2 + mouth_angle / 2
+                eye_x, eye_y = x + 4, y - 2
+            else:
+                # Default to right
+                start_angle = mouth_angle / 2
+                end_angle = 2 * math.pi - mouth_angle / 2
+                eye_x, eye_y = x - 2, y - 6
+            
+            # Draw the arc (Pac-Man body with mouth)
+            # Since pygame doesn't have a filled arc, we'll draw it using a polygon
+            points = [(x, y)]  # Center point
+            
+            # Create points along the arc
+            num_points = 20
+            angle_step = (end_angle - start_angle) / num_points
+            
+            for i in range(num_points + 1):
+                angle = start_angle + i * angle_step
+                px = x + radius * math.cos(angle)
+                py = y + radius * math.sin(angle)
+                points.append((px, py))
+            
+            # Draw filled polygon
+            if len(points) > 2:
+                pygame.draw.polygon(surface, color, points)
+            
+            # Draw eye
+            pygame.draw.circle(surface, (0, 0, 0), (int(eye_x), int(eye_y)), 2)
 
     def draw_ghost(self, surface, ghost_data):
-        """Draw simple ghost"""
+        """Draw classic Pac-Man style ghost"""
         x = int(ghost_data['x'] * CELL_SIZE + CELL_SIZE // 2)
         y = int(ghost_data['y'] * CELL_SIZE + CELL_SIZE // 2)
         
@@ -125,26 +195,64 @@ class SimpleGameClient:
         
         color = color_map.get(ghost_data.get('color', 'red'), COLORS['ghost_red'])
         
-        # Ghost body
-        pygame.draw.circle(surface, color, (x, y), GHOST_RADIUS)
+        # Draw classic ghost shape
+        self._draw_classic_ghost(surface, x, y, color, GHOST_RADIUS)
+    
+    def _draw_classic_ghost(self, surface, x, y, color, radius):
+        """Draw a classic Pac-Man ghost shape"""
+        # Ghost body - rounded top, flat bottom with wave pattern
         
-        # Simple wavy bottom
-        bottom_y = y + GHOST_RADIUS
-        points = []
-        for i in range(5):
-            wave_x = x - GHOST_RADIUS + (i * GHOST_RADIUS // 2)
-            wave_y = bottom_y + int(math.sin(time.time() * 5 + i) * 3)
-            points.append((wave_x, wave_y))
+        # Draw the rounded top part (semi-circle)
+        top_rect = pygame.Rect(x - radius, y - radius, radius * 2, radius * 2)
+        pygame.draw.rect(surface, color, pygame.Rect(x - radius, y - radius//2, radius * 2, radius + radius//2))
+        pygame.draw.circle(surface, color, (x, y - radius//2), radius)
         
-        if len(points) >= 3:
-            points = [(x - GHOST_RADIUS, bottom_y)] + points + [(x + GHOST_RADIUS, bottom_y)]
-            pygame.draw.polygon(surface, color, points)
+        # Draw wavy bottom
+        bottom_y = y + radius//2
+        wave_points = []
         
-        # Eyes
-        pygame.draw.circle(surface, (255, 255, 255), (x - 6, y - 5), 4)
-        pygame.draw.circle(surface, (0, 0, 0), (x - 6, y - 5), 2)
-        pygame.draw.circle(surface, (255, 255, 255), (x + 6, y - 5), 4)
-        pygame.draw.circle(surface, (0, 0, 0), (x + 6, y - 5), 2)
+        # Create wave pattern
+        num_waves = 4
+        wave_width = (radius * 2) // num_waves
+        
+        for i in range(num_waves + 1):
+            wave_x = x - radius + (i * wave_width)
+            if i % 2 == 0:
+                wave_y = bottom_y
+            else:
+                wave_y = bottom_y + 6
+            wave_points.append((wave_x, wave_y))
+        
+        # Complete the ghost shape
+        ghost_points = [
+            (x - radius, y - radius//2),  # Top left
+            (x - radius, bottom_y)        # Bottom left
+        ]
+        ghost_points.extend(wave_points)
+        ghost_points.append((x + radius, bottom_y))  # Bottom right
+        ghost_points.append((x + radius, y - radius//2))  # Top right
+        
+        pygame.draw.polygon(surface, color, ghost_points)
+        
+        # Draw the rounded top
+        pygame.draw.circle(surface, color, (x, y - radius//2), radius)
+        
+        # Draw classic ghost eyes
+        eye_radius = 4
+        pupil_radius = 2
+        
+        # Left eye
+        left_eye_x, left_eye_y = x - 6, y - 8
+        pygame.draw.circle(surface, (255, 255, 255), (left_eye_x, left_eye_y), eye_radius)
+        pygame.draw.circle(surface, (0, 0, 0), (left_eye_x, left_eye_y), pupil_radius)
+        
+        # Right eye
+        right_eye_x, right_eye_y = x + 6, y - 8
+        pygame.draw.circle(surface, (255, 255, 255), (right_eye_x, right_eye_y), eye_radius)
+        pygame.draw.circle(surface, (0, 0, 0), (right_eye_x, right_eye_y), pupil_radius)
+        
+        # Add a subtle outline for better visibility
+        pygame.draw.circle(surface, (0, 0, 0), (x, y - radius//2), radius, 1)
 
     def draw_ui(self, surface, data):
         """Draw simple UI"""
