@@ -1,0 +1,977 @@
+================================================================================
+                    ROOM-BASED MULTIPLAYER PAC-MAN CODE DOCUMENTATION
+================================================================================
+
+TABLE OF CONTENTS:
+1. ARCHITECTURE OVERVIEW
+2. SERVER-SIDE FILES
+3. CLIENT-SIDE FILES
+4. DATA FLOW EXPLANATION
+5. GAME MECHANICS
+6. NETWORKING PROTOCOL
+7. TESTING FILES
+
+================================================================================
+1. ARCHITECTURE OVERVIEW
+================================================================================
+
+The system uses a CLIENT-SERVER architecture with the following components:
+
+┌─────────────────────────────────────────────────────────────────┐
+│                        SYSTEM ARCHITECTURE                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  CLIENT 1    CLIENT 2    CLIENT 3    CLIENT 4                  │
+│     │           │           │           │                       │
+│     └───────────┼───────────┼───────────┘                       │
+│                 │           │                                   │
+│                 ▼           ▼                                   │
+│            ┌─────────────────────────┐                          │
+│            │      SERVER MAIN        │                          │
+│            │   (WebSocket Handler)   │                          │
+│            └──────────┬──────────────┘                          │
+│                       │                                         │
+│                       ▼                                         │
+│            ┌─────────────────────────┐                          │
+│            │    ROOM MANAGER         │                          │
+│            │  (Assigns Players)      │                          │
+│            └──────────┬──────────────┘                          │
+│                       │                                         │
+│            ┌──────────▼──────────────┐                          │
+│            │      GAME ROOMS         │                          │
+│            │  Room A    │   Room B   │                          │
+│            │ (2 players)│ (2 players)│                          │
+│            └────────────────────────┘                          │
+└─────────────────────────────────────────────────────────────────┘
+
+KEY CONCEPTS:
+- Maximum 2 players per room
+- Automatic room creation when needed
+- Independent game states for each room
+- Real-time synchronization using WebSockets
+
+================================================================================
+2. SERVER-SIDE FILES
+================================================================================
+
+2.1 SERVER/MAIN.PY - Main Server Entry Point
+================================================================================
+
+PURPOSE: 
+- WebSocket server that handles client connections
+- Routes players to appropriate rooms
+- Manages server lifecycle
+
+MAIN FUNCTIONS:
+
+async def handle_client(websocket):
+    """
+    WHAT IT DOES: Handles each client connection from start to finish
+    
+    STEP-BY-STEP PROCESS:
+    1. Client connects via WebSocket
+    2. Assigns client to a room (creates new room if needed)
+    3. Sends room assignment confirmation
+    4. Listens for client input messages
+    5. Forwards input to the appropriate room
+    6. Handles disconnection cleanup
+    
+    ERROR HANDLING:
+    - JSON parsing errors
+    - Connection drops
+    - Unexpected exceptions
+    """
+
+async def status_reporter():
+    """
+    WHAT IT DOES: Periodic status reporting every 30 seconds
+    
+    REPORTS:
+    - Number of active rooms
+    - Total players online
+    - Players per room breakdown
+    
+    PURPOSE: Helps monitor server health and usage
+    """
+
+async def main():
+    """
+    WHAT IT DOES: Server startup and lifecycle management
+    
+    INITIALIZATION SEQUENCE:
+    1. Print server information
+    2. Start room manager
+    3. Start status reporter task
+    4. Create WebSocket server on port 8765
+    5. Wait indefinitely for connections
+    6. Handle graceful shutdown on Ctrl+C
+    """
+
+2.2 SERVER/ROOM_MANAGER.PY - Room Management System
+================================================================================
+
+PURPOSE:
+- Manages multiple game rooms
+- Assigns players to rooms based on availability
+- Handles room lifecycle (creation/cleanup)
+
+CLASS: RoomManager
+
+MAIN ATTRIBUTES:
+- rooms: Dict[str, GameRoom] - All active rooms
+- player_to_room: Dict[int, str] - Maps player IDs to room IDs
+- cleanup_interval: int - How often to clean up empty rooms
+
+KEY METHODS:
+
+async def assign_player_to_room(self, websocket) -> Optional[str]:
+    """
+    ASSIGNMENT LOGIC:
+    1. Check if player already assigned to a room
+    2. Find first available room (not full)
+    3. If no available room found, create new room
+    4. Add player to the chosen room
+    5. Start room's game loop if first player
+    6. Return room ID for confirmation
+    
+    ROOM CREATION:
+    - Generates unique 8-character room ID
+    - Creates new GameRoom instance
+    - Adds to rooms dictionary
+    """
+
+async def remove_player_from_room(self, websocket):
+    """
+    CLEANUP PROCESS:
+    1. Find player's current room
+    2. Remove player from room
+    3. Update tracking dictionaries
+    4. Schedule room cleanup if empty
+    5. Clean up player references
+    """
+
+async def handle_player_input(self, websocket, message):
+    """
+    INPUT ROUTING:
+    1. Identify player's room
+    2. Forward input message to room
+    3. Let room handle game-specific logic
+    """
+
+def get_room_stats(self) -> Dict:
+    """
+    STATISTICS COLLECTION:
+    - Total rooms count
+    - Active rooms (non-empty)
+    - Total players across all rooms
+    - Detailed per-room information
+    
+    USED FOR: Monitoring and debugging
+    """
+
+async def _cleanup_loop(self):
+    """
+    PERIODIC MAINTENANCE:
+    1. Runs every 60 seconds
+    2. Finds empty rooms older than 5 minutes
+    3. Removes old empty rooms to save memory
+    4. Logs current statistics
+    """
+
+2.3 SERVER/GAME_ROOM.PY - Individual Game Instance
+================================================================================
+
+PURPOSE:
+- Manages a single game instance with max 2 players
+- Handles game logic, physics, and state
+- Manages ghosts AI and player interactions
+
+CLASS: GameRoom
+
+GAME CONSTANTS:
+- MAX_PLAYERS = 2 (Room capacity limit)
+- CELL_SIZE = 40 (Pixel size of each maze cell)
+- ROWS = 15, COLS = 19 (Maze dimensions)
+- PLAYER_SPEED = 0.2 (Movement speed per frame)
+- GHOST_SPEED = 0.08 (Ghost movement speed)
+- POWER_TIME = 200 (Frames of power pellet effect)
+
+MAZE SYSTEM:
+- ORIGINAL_MAZE: Template maze layout
+  - 0 = Empty space
+  - 1 = Wall
+  - 2 = Regular pellet (10 points)
+  - 3 = Power pellet (50 points + ghost vulnerability)
+
+KEY METHODS:
+
+def __init__(self, room_id):
+    """
+    ROOM INITIALIZATION:
+    1. Create unique room ID
+    2. Initialize empty players dictionary
+    3. Copy maze template
+    4. Create ghost instances
+    5. Set up game state variables
+    """
+
+async def add_player(self, websocket):
+    """
+    PLAYER ADDITION PROCESS:
+    1. Check room capacity (reject if full)
+    2. Add to clients set for broadcasting
+    3. Create player data structure with:
+       - Position (corner spawn points for 2 players)
+       - Score, health, power state
+       - Input keys, movement direction
+    4. Start game loop if first player
+    """
+
+def can_move(self, x, y):
+    """
+    COLLISION DETECTION:
+    1. Check boundary limits
+    2. Check center point against maze walls
+    3. Check corners if near grid lines
+    4. Return True if movement is valid
+    
+    ALGORITHM:
+    - Uses floating-point positions for smooth movement
+    - Checks multiple points for accurate collision
+    - Allows slight overlap for better gameplay feel
+    """
+
+def _update_players(self):
+    """
+    PLAYER PHYSICS ENGINE:
+    1. Process input keys for each player
+    2. Calculate target position based on speed
+    3. Validate movement with collision detection
+    4. Update player position if valid
+    5. Snap to grid for pellet collection
+    6. Handle pellet collection and scoring
+    7. Apply power pellet effects
+    
+    MOVEMENT SYSTEM:
+    - Continuous movement while key held
+    - Grid-snapping for precise pellet collection
+    - Direction tracking for ghost AI
+    """
+
+def _update_ghosts(self):
+    """
+    GHOST AI SYSTEM:
+    1. Update each ghost's behavior AI
+    2. Calculate movement based on current behavior
+    3. Apply collision detection
+    4. Handle stuck situations with random movement
+    
+    AI BEHAVIORS:
+    - Aggressive: Chase closest player
+    - Patrol: Move between preset points
+    - Ambush: Predict player movement
+    - Random: Unpredictable movement
+    - Confused: Frequent direction changes
+    """
+
+def _update_ghost_behavior(self, ghost):
+    """
+    ADVANCED AI LOGIC:
+    1. Behavior change timer (60-180 frames)
+    2. Randomness factor (0.4-0.9) for unpredictability
+    3. Player power state detection
+    4. Flee behavior when players powered
+    5. Target selection based on behavior type
+    6. Pathfinding with randomization
+    
+    DYNAMIC BEHAVIOR:
+    - Ghosts change behavior every 2-6 seconds
+    - Random chance to ignore planned behavior
+    - Balanced difficulty through unpredictability
+    """
+
+def _check_player_death(self):
+    """
+    COLLISION DETECTION:
+    1. Check distance between each player and ghost
+    2. If collision detected:
+       - Player has power: Ghost eaten (200 points)
+       - Player no power: Player dies
+    3. Decrement power timer each frame
+    
+    COLLISION THRESHOLD: 0.8 units (allows close gameplay)
+    """
+
+async def _game_loop(self):
+    """
+    MAIN GAME ENGINE:
+    Runs at 20 FPS (50ms intervals)
+    
+    EACH FRAME:
+    1. Update all players (movement, pellets)
+    2. Update all ghosts (AI, movement)
+    3. Check player-ghost collisions
+    4. Broadcast game state to all clients
+    5. Sleep for frame timing
+    
+    LIFECYCLE:
+    - Starts when first player joins
+    - Stops when room becomes empty
+    - Handles cancellation gracefully
+    """
+
+async def _broadcast_game_state(self):
+    """
+    NETWORK SYNCHRONIZATION:
+    1. Collect all game state data:
+       - Player positions, scores, status
+       - Ghost positions, behaviors
+       - Maze state (pellets remaining)
+       - Game statistics
+    2. Serialize to JSON
+    3. Send to all connected clients
+    4. Handle disconnected clients cleanup
+    
+    DATA STRUCTURE:
+    {
+        "room_id": "abc12345",
+        "players": {...},
+        "ghosts": [...],
+        "maze": [[...]],
+        "game_stats": {...}
+    }
+    """
+
+2.4 SERVER/GHOST CLASS - AI Entity
+================================================================================
+
+CLASS: Ghost (Inner class of GameRoom)
+
+ATTRIBUTES:
+- x, y: Current position (float for smooth movement)
+- target_x, target_y: Destination coordinates
+- dx, dy: Movement direction vector
+- behavior: Base behavior type ("aggressive", "patrol", etc.)
+- current_behavior: Active behavior (can change dynamically)
+- color: Visual identification ("red", "orange", "purple", "green")
+- home_x, home_y: Spawn/reset position
+- mode_timer: Behavior change timing
+- randomness_factor: Individual unpredictability (0.3-0.8)
+- path: Planned movement queue
+- last_positions: Recent positions for stuck detection
+
+GHOST AI BEHAVIORS:
+
+1. AGGRESSIVE:
+   - 80% chance to chase closest player
+   - 20% chance to move randomly
+   - Most dangerous but predictable
+
+2. PATROL:
+   - Moves between predefined patrol points
+   - Changes patrol target every 100-400 frames
+   - Provides map coverage
+
+3. AMBUSH:
+   - Predicts player movement direction
+   - Moves to intercept rather than chase
+   - 60% chance to predict, 40% random
+
+4. RANDOM:
+   - Pure random movement
+   - Changes direction every 50-150 frames
+   - Unpredictable but less threatening
+
+5. CONFUSED:
+   - Frequent direction changes (30-80 frames)
+   - Creates chaotic movement patterns
+   - Adds gameplay variety
+
+BEHAVIOR SWITCHING:
+- Each ghost changes behavior every 60-180 frames (3-9 seconds)
+- Random chance to ignore current behavior each frame
+- Power mode triggers flee behavior (70% flee, 30% random)
+
+================================================================================
+3. CLIENT-SIDE FILES
+================================================================================
+
+3.1 CLIENT/MAIN.PY - Game Client
+================================================================================
+
+PURPOSE:
+- Connects to server via WebSocket
+- Renders game graphics using pygame
+- Handles player input and sends to server
+- Displays game state received from server
+
+CLASS: SimpleGameClient
+
+INITIALIZATION ATTRIBUTES:
+- screen: Pygame display surface
+- clock: Frame rate controller (60 FPS)
+- last_data: Cached game state for smooth rendering
+- current_player_id: Unique identifier for this client
+- server_url: WebSocket server address
+- room_id: Current room assignment
+- connection_status: Connection state message
+
+MAIN METHODS:
+
+def init_display(self):
+    """
+    DISPLAY SETUP:
+    1. Initialize pygame and font systems
+    2. Check for available display
+    3. Create game window (19*40 + 250) x (15*40) pixels
+    4. Set window title
+    5. Handle display initialization errors
+    
+    WINDOW LAYOUT:
+    - Left side: Game area (760x600 pixels)
+    - Right side: UI panel (250 pixels wide)
+    """
+
+def draw_maze(self, surface, maze):
+    """
+    MAZE RENDERING:
+    1. Iterate through maze 2D array
+    2. For each cell type:
+       - 1 (Wall): Blue rectangle
+       - 2 (Pellet): Small yellow circle
+       - 3 (Power): Large white circle
+    3. Calculate pixel positions from grid coordinates
+    
+    CELL MAPPING:
+    Grid coordinate (x,y) → Pixel (x*40, y*40)
+    """
+
+def draw_player(self, surface, player_data, player_id, is_current):
+    """
+    PLAYER RENDERING:
+    1. Convert grid position to pixel coordinates
+    2. Choose color based on player ID hash
+    3. Draw different states:
+       - Dead: Gray circle
+       - Alive: Colored circle with eyes
+       - Powered: Additional white glow ring
+       - Current player: White border highlight
+    
+    PLAYER COLORS:
+    - Player 1: Yellow (classic Pac-Man)
+    - Player 2: Cyan
+    - Player 3: Magenta  
+    - Player 4: Green
+    """
+
+def draw_ghost(self, surface, ghost_data):
+    """
+    GHOST RENDERING:
+    1. Get ghost position and color
+    2. Draw main ghost body (circle)
+    3. Draw wavy bottom using sine wave
+    4. Draw white eyes with black pupils
+    5. Animate wavy bottom using time-based sine function
+    
+    GHOST COLORS:
+    - Red: Aggressive behavior
+    - Orange: Patrol behavior
+    - Purple: Ambush behavior
+    - Green: Random behavior
+    """
+
+def draw_ui(self, surface, data):
+    """
+    USER INTERFACE RENDERING:
+    Right panel contains:
+    
+    1. TITLE SECTION:
+       - "PAC-MAN" in large font
+       - Room ID or connection status
+    
+    2. PLAYERS SECTION:
+       - List of all players in room
+       - Colored dots for identification
+       - Score and status for each player
+       - Power mode indicator
+    
+    3. GAME STATS SECTION:
+       - Pellets remaining
+       - Alive/total players
+       - Room capacity (current/max)
+       - Game tick counter
+       - Victory message if won
+    
+    4. CONTROLS SECTION:
+       - Arrow keys: Movement
+       - R: Restart when dead
+       - ESC: Exit game
+    """
+
+def draw_death_overlay(self, surface, player_data):
+    """
+    DEATH SCREEN:
+    1. Check if current player is dead
+    2. Draw semi-transparent red overlay
+    3. Display death message
+    4. Show final score
+    5. Show restart instructions
+    
+    OVERLAY EFFECT:
+    - 50% transparent red tint
+    - Centered text messages
+    - Clear restart instructions
+    """
+
+async def handle_input(self, websocket):
+    """
+    INPUT PROCESSING:
+    1. Capture pygame events (60 FPS polling)
+    2. Handle different event types:
+       - QUIT: Close application
+       - KEYDOWN: Send key press to server
+       - KEYUP: Send key release to server
+    3. Track held keys to prevent spam
+    4. Send JSON messages to server
+    
+    KEY MAPPING:
+    - Arrow keys → "UP", "DOWN", "LEFT", "RIGHT"
+    - R key → "RESTART"
+    - ESC key → Exit application
+    
+    MESSAGE FORMAT:
+    {"key": "UP", "action": "press"}
+    {"key": "UP", "action": "release"}
+    """
+
+async def game_loop(self, websocket):
+    """
+    MAIN RENDERING LOOP:
+    1. Receive game state from server (10ms timeout)
+    2. Handle special messages (room assignment)
+    3. Clear screen to black
+    4. Draw maze, players, ghosts
+    5. Draw UI panel
+    6. Draw death overlay if needed
+    7. Update display and maintain 60 FPS
+    
+    ERROR HANDLING:
+    - Timeout: Use cached game state
+    - Connection closed: Exit gracefully
+    - JSON errors: Log and continue
+    """
+
+async def run(self):
+    """
+    CLIENT LIFECYCLE:
+    1. Initialize display system
+    2. Connect to WebSocket server
+    3. Set current player ID
+    4. Start parallel tasks:
+       - Input handling
+       - Game loop rendering
+    5. Wait for either task to complete
+    6. Cancel remaining tasks
+    7. Clean up pygame
+    
+    CONNECTION HANDLING:
+    - Retry connection attempts
+    - Handle network errors
+    - Graceful shutdown on errors
+    """
+
+3.2 CLIENT/RENDERER.PY - Legacy Rendering Functions
+================================================================================
+
+PURPOSE: Legacy rendering functions (mostly unused in current system)
+
+FUNCTIONS:
+
+def init():
+    """
+    LEGACY DISPLAY INITIALIZATION:
+    - Creates 800x600 window
+    - Sets up initial player list
+    - Used in older version of client
+    """
+
+def draw(screen, players):
+    """
+    LEGACY DRAWING FUNCTION:
+    - Simple circle drawing for players
+    - No maze or UI rendering
+    - Kept for compatibility
+    """
+
+COLOR DEFINITIONS:
+- Yellow: (255, 255, 0) - Classic Pac-Man
+- Cyan: (0, 255, 255) - Player 2 color
+
+================================================================================
+4. DATA FLOW EXPLANATION
+================================================================================
+
+4.1 CLIENT CONNECTION SEQUENCE
+================================================================================
+
+1. CLIENT STARTUP:
+   Client → WebSocket connection → Server
+
+2. SERVER ROOM ASSIGNMENT:
+   Server → Find/Create room → Assign player → Send room_id
+
+3. CLIENT ACKNOWLEDGMENT:
+   Client → Receives room assignment → Updates UI
+
+4. GAME LOOP START:
+   Room → Start game loop → Begin broadcasting states
+
+4.2 INPUT PROCESSING FLOW
+================================================================================
+
+1. PLAYER INPUT:
+   Player presses arrow key → pygame.KEYDOWN event
+
+2. CLIENT PROCESSING:
+   Client → Creates JSON message → Sends via WebSocket
+
+3. SERVER ROUTING:
+   Server → RoomManager → Forwards to correct GameRoom
+
+4. ROOM PROCESSING:
+   GameRoom → Updates player's key set → Affects movement
+
+5. GAME STATE UPDATE:
+   GameRoom → Updates player position → Broadcasts to all clients
+
+4.3 GAME STATE SYNCHRONIZATION
+================================================================================
+
+EVERY FRAME (20 FPS on server, 60 FPS on client):
+
+1. SERVER GAME LOOP:
+   - Update all players (movement, pellet collection)
+   - Update all ghosts (AI, movement)
+   - Check collisions (player-ghost, player-pellet)
+   - Calculate game statistics
+
+2. STATE BROADCASTING:
+   - Serialize all game data to JSON
+   - Send to all clients in room simultaneously
+   - Handle disconnected clients
+
+3. CLIENT RENDERING:
+   - Receive JSON game state
+   - Parse and cache data
+   - Render at 60 FPS for smooth visuals
+   - Use cached state if no new data
+
+4.4 ROOM MANAGEMENT FLOW
+================================================================================
+
+PLAYER JOINS:
+1. Client connects → Server assigns to available room
+2. If no room available → Create new room
+3. Room capacity check → Max 2 players per room
+4. Start room game loop if first player
+
+PLAYER LEAVES:
+1. Client disconnects → Remove from room
+2. Check room emptiness → Schedule cleanup if empty
+3. Stop game loop if no players remain
+4. Clean up resources after delay
+
+ROOM LIFECYCLE:
+Creation → Player Assignment → Game Running → Player Removal → Cleanup
+
+================================================================================
+5. GAME MECHANICS
+================================================================================
+
+5.1 MOVEMENT SYSTEM
+================================================================================
+
+PLAYER MOVEMENT:
+- Grid-based with smooth interpolation
+- 0.2 units per frame movement speed
+- Collision detection against walls
+- Automatic grid snapping for pellet collection
+
+PHYSICS ENGINE:
+1. Input Detection → Key press/release
+2. Target Calculation → Current position + speed vector
+3. Collision Check → Wall detection system
+4. Position Update → If movement valid
+5. Grid Snapping → When close to grid intersection
+
+COLLISION DETECTION:
+- Multi-point checking (center + corners)
+- Floating-point precision
+- Boundary validation
+- Wall intersection prevention
+
+5.2 GHOST AI SYSTEM
+================================================================================
+
+AI COMPLEXITY LAYERS:
+
+1. BEHAVIOR SELECTION:
+   - Base behavior assigned at creation
+   - Dynamic behavior switching (every 2-6 seconds)
+   - Randomness injection (40-90% chance to ignore plan)
+
+2. TARGET SELECTION:
+   - Player position tracking
+   - Power state awareness
+   - Flee behavior when players powered
+   - Predictive movement for ambush
+
+3. PATHFINDING:
+   - Simple best-direction selection
+   - Obstacle avoidance
+   - Stuck detection and recovery
+   - Random movement fallback
+
+4. MOVEMENT EXECUTION:
+   - 0.08 units per frame (slower than players)
+   - Collision detection
+   - Grid snapping for precision
+   - Direction change validation
+
+5.3 SCORING SYSTEM
+================================================================================
+
+POINT VALUES:
+- Regular Pellet: 10 points
+- Power Pellet: 50 points + power mode
+- Ghost Consumption: 200 points (when powered)
+
+POWER MODE:
+- Duration: 200 frames (10 seconds at 20 FPS)
+- Effect: Ghosts become vulnerable
+- Visual: Player has white glow ring
+- Strategy: Risk vs reward gameplay
+
+VICTORY CONDITION:
+- All pellets collected from maze
+- Shared victory for both players in room
+- Maze resets when player dies and restarts
+
+================================================================================
+6. NETWORKING PROTOCOL
+================================================================================
+
+6.1 MESSAGE TYPES
+================================================================================
+
+CLIENT → SERVER MESSAGES:
+
+1. INPUT MESSAGES:
+   {
+     "key": "UP|DOWN|LEFT|RIGHT|RESTART",
+     "action": "press|release"
+   }
+
+SERVER → CLIENT MESSAGES:
+
+1. ROOM ASSIGNMENT:
+   {
+     "type": "room_assignment",
+     "room_id": "abc12345",
+     "message": "Assigned to room abc12345"
+   }
+
+2. GAME STATE:
+   {
+     "room_id": "abc12345",
+     "players": {
+       "player_id_1": {
+         "x": 1.0, "y": 1.0,
+         "score": 150,
+         "dead": false,
+         "power": 0,
+         "name": "Player1",
+         "direction": "RIGHT"
+       }
+     },
+     "ghosts": [
+       {
+         "x": 9.0, "y": 7.0,
+         "behavior": "aggressive",
+         "color": "red"
+       }
+     ],
+     "maze": [[1,1,1,...], [1,2,2,...]],
+     "game_stats": {
+       "total_pellets": 145,
+       "alive_players": 1,
+       "total_players": 2,
+       "victory": false,
+       "game_tick": 1500,
+       "max_players": 2
+     }
+   }
+
+6.2 WEBSOCKET COMMUNICATION
+================================================================================
+
+CONNECTION HANDLING:
+- Server binds to 0.0.0.0:8765 (all interfaces)
+- Clients connect to ws://localhost:8765
+- Automatic reconnection on client side
+- Graceful disconnection handling
+
+ERROR HANDLING:
+- JSON parsing errors → Log and ignore
+- Connection drops → Automatic cleanup
+- Network timeouts → Use cached state
+- Server shutdown → Graceful client exit
+
+PERFORMANCE OPTIMIZATION:
+- Server: 20 FPS game updates (50ms intervals)
+- Client: 60 FPS rendering (16.67ms intervals)
+- Message compression via JSON
+- Efficient serialization of game state
+
+================================================================================
+7. TESTING FILES
+================================================================================
+
+7.1 SERVER/TEST_ROOMS.PY - Unit Testing
+================================================================================
+
+PURPOSE: Tests room management logic without networking
+
+TEST SCENARIOS:
+1. Room Assignment Logic
+2. Player Capacity Enforcement  
+3. Room Creation Triggers
+4. Player Removal Handling
+5. Statistics Accuracy
+
+MOCK OBJECTS:
+- MockWebSocket: Simulates client connections
+- Room lifecycle testing
+- Concurrent player simulation
+
+7.2 TEST_CLIENT.PY - Integration Testing
+================================================================================
+
+PURPOSE: Tests complete system with real WebSocket connections
+
+TEST SEQUENCE:
+1. Connect 4 clients simultaneously
+2. Verify room assignments (2 rooms with 2 players each)
+3. Send test inputs to verify message routing
+4. Monitor server-side room statistics
+5. Test disconnection handling
+
+OUTPUT VERIFICATION:
+- Room assignment messages
+- Player distribution across rooms
+- Input message forwarding
+- Game state broadcasting
+
+================================================================================
+8. CONFIGURATION AND CUSTOMIZATION
+================================================================================
+
+8.1 SERVER CONFIGURATION
+================================================================================
+
+ROOM SETTINGS (GameRoom class):
+- MAX_PLAYERS: Change room capacity limit
+- PLAYER_SPEED: Adjust player movement speed
+- GHOST_SPEED: Adjust ghost difficulty
+- POWER_TIME: Power pellet duration
+- GRID_SNAP_THRESHOLD: Movement precision
+
+NETWORK SETTINGS (main.py):
+- Server port: 8765 (change in websockets.serve call)
+- Server address: "0.0.0.0" (all interfaces)
+- Status report interval: 30 seconds
+
+AI SETTINGS (Ghost class):
+- Behavior change interval: 60-180 frames
+- Randomness factors: 0.3-0.8 range
+- Movement speed multiplier
+- Pathfinding depth limit
+
+8.2 CLIENT CONFIGURATION
+================================================================================
+
+DISPLAY SETTINGS:
+- Window size: Calculated from maze dimensions
+- Frame rate: 60 FPS
+- UI panel width: 250 pixels
+- Font sizes: Large(32), Medium(24), Small(18)
+
+NETWORK SETTINGS:
+- Server URL: ws://192.168.94.1:8765
+- Connection timeout: 0.1 seconds per message
+- Retry logic: Built into websockets library
+
+COLOR SCHEME:
+- Customizable in COLORS dictionary
+- Player colors, ghost colors, UI colors
+- Background and wall colors
+
+8.3 GAME BALANCE
+================================================================================
+
+DIFFICULTY TUNING:
+- Ghost speed vs player speed ratio
+- AI randomness levels
+- Power mode duration
+- Point values for scoring
+
+PERFORMANCE TUNING:
+- Server frame rate (affects responsiveness)
+- Client frame rate (affects smoothness)  
+- Network message frequency
+- Room cleanup intervals
+
+================================================================================
+9. TROUBLESHOOTING GUIDE
+================================================================================
+
+COMMON ISSUES:
+
+1. "ImportError: attempted relative import":
+   - Fix: Use absolute imports in room_manager.py
+   - Change "from .game_room" to "from game_room"
+
+2. Server stops immediately:
+   - Fix: Ensure infinite loop in main()
+   - Use asyncio.Event().wait() not asyncio.Future()
+
+3. Client can't connect:
+   - Check server is running first
+   - Verify port 8765 is available
+   - Check firewall settings
+
+4. Players in wrong rooms:
+   - Verify room assignment logic
+   - Check MAX_PLAYERS setting
+   - Monitor server logs for room creation
+
+5. Game lag or stuttering:
+   - Adjust server/client frame rates
+   - Check network latency
+   - Monitor CPU usage
+
+6. Ghost AI too easy/hard:
+   - Modify GHOST_SPEED setting
+   - Adjust AI randomness factors
+   - Change behavior switching frequency
+
+================================================================================
+END OF DOCUMENTATION
+================================================================================
+
+This documentation covers the complete architecture and implementation details 
+of the room-based multiplayer Pac-Man system. Each component is explained with
+its purpose, key methods, data flows, and customization options.
+
+For additional questions or modifications, refer to the specific file sections
+and the troubleshooting guide.

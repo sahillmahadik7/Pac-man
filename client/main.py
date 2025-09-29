@@ -36,6 +36,8 @@ class SimpleGameClient:
         self.last_data = {}
         self.current_player_id = None
         self.server_url = "ws://192.168.94.1:8765"
+        self.room_id = None
+        self.connection_status = "Connecting..."
 
     def init_display(self):
         """Initialize display"""
@@ -161,7 +163,16 @@ class SimpleGameClient:
         # Title
         title = font_large.render("PAC-MAN", True, COLORS['ui_text'])
         surface.blit(title, (ui_x, y_offset))
-        y_offset += 50
+        y_offset += 40
+        
+        # Room Information
+        if self.room_id:
+            room_text = font_small.render(f"Room: {self.room_id}", True, COLORS['power_pellet'])
+            surface.blit(room_text, (ui_x, y_offset))
+        else:
+            status_text = font_small.render(self.connection_status, True, COLORS['ui_text'])
+            surface.blit(status_text, (ui_x, y_offset))
+        y_offset += 25
         
         # Players
         players_title = font_medium.render("PLAYERS", True, COLORS['ui_text'])
@@ -202,9 +213,11 @@ class SimpleGameClient:
         y_offset += 30
         
         game_stats = data.get('game_stats', {})
+        max_players = game_stats.get('max_players', 2)
         stats = [
             f"Pellets Left: {game_stats.get('total_pellets', 0)}",
             f"Players: {game_stats.get('alive_players', 0)}/{game_stats.get('total_players', 0)}",
+            f"Room Capacity: {game_stats.get('total_players', 0)}/{max_players}",
             f"Game Tick: {game_stats.get('game_tick', 0)}"
         ]
         
@@ -319,6 +332,14 @@ class SimpleGameClient:
                 # Receive game state
                 message = await asyncio.wait_for(websocket.recv(), timeout=0.1)
                 data = json.loads(message)
+                
+                # Handle room assignment messages
+                if data.get("type") == "room_assignment":
+                    self.room_id = data.get("room_id")
+                    self.connection_status = f"Connected to room {self.room_id}"
+                    print(f"Assigned to room: {self.room_id}")
+                    continue
+                
                 self.last_data = data
             except asyncio.TimeoutError:
                 data = self.last_data
