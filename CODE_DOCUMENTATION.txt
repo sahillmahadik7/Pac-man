@@ -10,7 +10,10 @@ TABLE OF CONTENTS:
 5. GAME MECHANICS
 6. NETWORKING PROTOCOL
 7. TESTING FILES
-
+8. CONFIGURATION AND CUSTOMIZATION
+9. TROUBLESHOOTING GUIDE
+10. LOAD BALANCER ARCHITECTURE
+11. DISTRIBUTED CONCEPT: CIRCUIT BREAKER PATTERN
 ================================================================================
 1. ARCHITECTURE OVERVIEW
 ================================================================================
@@ -964,6 +967,73 @@ COMMON ISSUES:
    - Modify GHOST_SPEED setting
    - Adjust AI randomness factors
    - Change behavior switching frequency
+
+================================================================================
+10. LOAD BALANCER ARCHITECTURE
+================================================================================
+
+PURPOSE:
+- Accepts all client WebSocket connections on a single public port
+- Distributes connections across multiple backend game servers
+- Provides resilience when a backend fails
+
+FILE: server/load_balancer.py
+
+MODE: Layer-7 reverse proxy for WebSockets (message-level pass-through)
+
+SELECTION STRATEGY:
+- Least-connections: new clients go to the backend with the fewest active connections
+- Tie-breaker: first configured backend wins
+
+HEALTH AND FAILOVER:
+- Passive health via connection attempts and runtime errors
+- Exponential backoff cooldown per backend (2s, 4s, 8s, 16s, max 30s)
+- Clients are informed if no backends are currently available
+
+CONFIGURATION:
+- --port (or PACMAN_LB_PORT): Frontend port (default: 8765)
+- --backends (or PACMAN_BACKENDS): Comma-separated backend URLs
+  Example: ws://localhost:8766,ws://localhost:8767
+
+HOW IT WORKS:
+1) Client connects to load balancer (ws://host:8765)
+2) LB selects a backend using least-connections
+3) LB establishes a WebSocket to the backend and relays messages bidirectionally
+4) On closure/error, LB closes the other side and updates counters
+
+OPERATIONAL NOTES:
+- The LB is transparent: clients and servers do not need protocol changes
+- Backends should be started on distinct ports (e.g., 8766, 8767)
+
+================================================================================
+11. DISTRIBUTED CONCEPT: CIRCUIT BREAKER PATTERN
+================================================================================
+
+WHAT IS IT?
+A circuit breaker prevents an application from repeatedly calling an unhealthy
+service, allowing the service time to recover and protecting the system from
+cascading failures.
+
+STATES:
+- Closed: Calls flow normally; errors are counted
+- Open: Calls are short-circuited immediately for a cooldown window
+- Half-Open: A small number of trial calls are allowed to test recovery
+
+BENEFITS:
+- Faster failure response for clients
+- Reduced load on failing services
+- More stable system under partial outages
+
+APPLICATION IN THIS CODEBASE:
+- The load balancer applies a lightweight circuit breaker per backend:
+  - On connection failure, mark the backend with an exponential backoff cooldown
+  - During cooldown (Open), the backend is skipped for new connections
+  - On successful connect (Half-Open success), reset failure counters (Closed)
+
+RELATED IDEAS (OPTIONAL EXTENSIONS):
+- Sticky sessions via consistent hashing of client IDs to backends
+- Active health checks (periodic ping endpoints) to detect recovery faster
+- Outlier detection and ejection when a backend shows high error rates
 
 ================================================================================
 END OF DOCUMENTATION

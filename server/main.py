@@ -2,15 +2,39 @@
 import asyncio
 import websockets
 import json
+import argparse
+import os
+from urllib.parse import urlparse, parse_qs
 from room_manager import room_manager
 
-async def handle_client(websocket):
-    """Handle a new client connection"""
+async def handle_client(websocket, path=None):
+    """Handle a new client connection. Supports token-based room create/join via query params.
+    Query:
+      - action=create|join (optional; defaults to auto-assign)
+      - room=<token>      (when action is provided)
+    Compatible with websockets versions that pass either (websocket) or (websocket, path).
+    """
     print("Client connected")
     
     try:
-        # Assign player to a room
-        room_id = await room_manager.assign_player_to_room(websocket)
+        # Parse query params for token-based routing
+        room_id = None
+        req_path = path or getattr(websocket, "path", "")
+        if req_path:
+            parsed = urlparse(req_path)
+            qs = parse_qs(parsed.query)
+            action = (qs.get("action", [None])[0] or "").lower()
+            token = (qs.get("room", [None])[0] or "").strip()
+            if action in ("create", "join") and token:
+                create_if_missing = (action == "create")
+                room_id = await room_manager.add_player_to_specific_room(websocket, token, create_if_missing=create_if_missing)
+                if not room_id:
+                    await websocket.send(json.dumps({"type": "error", "message": "Unable to join/create the specified room."}))
+                    return
+        
+        # Fallback: automatic assignment
+        if not room_id:
+            room_id = await room_manager.assign_player_to_room(websocket)
         if not room_id:
             await websocket.send(json.dumps({"error": "Failed to assign to room"}))
             return
@@ -59,7 +83,7 @@ async def status_reporter():
     except asyncio.CancelledError:
         pass
 
-async def main():
+async def main(port: int = 8765):
     """Main server function"""
     print("🎮 Room-Based Pac-Man Multiplayer Server")
     print("========================================")
@@ -77,8 +101,8 @@ async def main():
     
     try:
         # Start WebSocket server
-        async with websockets.serve(handle_client, "0.0.0.0", 8765):
-            print("\n✅ Server running on ws://localhost:8765")
+        async with websockets.serve(handle_client, "0.0.0.0", port):
+            print(f"\n✅ Server running on ws://localhost:{port}")
             print("Players will be automatically assigned to rooms (max 2 per room)")
             print("Press Ctrl+C to stop the server\n")
             
@@ -95,7 +119,10 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        parser = argparse.ArgumentParser(description="Room-Based Pac-Man Server")
+        parser.add_argument("--port", type=int, default=int(os.getenv("PACMAN_SERVER_PORT", "8765")), help="Port to bind the game server on")
+        args = parser.parse_args()
+        asyncio.run(main(port=args.port))
     except KeyboardInterrupt:
         print("\nServer stopped")
     except Exception as e:

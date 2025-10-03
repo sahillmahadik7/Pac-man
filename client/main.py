@@ -5,6 +5,9 @@ import websockets
 import json
 import math
 import time
+import random
+import string
+import subprocess
 
 CELL_SIZE = 40
 PLAYER_RADIUS = 15
@@ -37,9 +40,11 @@ class SimpleGameClient:
         self.clock = pygame.time.Clock()
         self.last_data = {}
         self.current_player_id = None
-        self.server_url = "ws://192.168.94.1:8765"
+        self.server_url = "ws://localhost:8765"
         self.room_id = None
         self.connection_status = "Connecting..."
+        self.app_state = "menu"  # menu | game
+        self.menu_choice = None   # (action, token)
 
     def init_display(self):
         """Initialize display"""
@@ -180,8 +185,8 @@ class SimpleGameClient:
             # Draw eye
             pygame.draw.circle(surface, (0, 0, 0), (int(eye_x), int(eye_y)), 2)
 
-    def draw_ghost(self, surface, ghost_data):
-        """Draw classic Pac-Man style ghost"""
+    def draw_ghost(self, surface, ghost_data, frightened=False, velocity=(0, 0)):
+        """Draw classic Pac-Man style ghost with frightened mode and eye tracking"""
         x = int(ghost_data['x'] * CELL_SIZE + CELL_SIZE // 2)
         y = int(ghost_data['y'] * CELL_SIZE + CELL_SIZE // 2)
         
@@ -193,65 +198,56 @@ class SimpleGameClient:
             'green': COLORS['ghost_green']
         }
         
-        color = color_map.get(ghost_data.get('color', 'red'), COLORS['ghost_red'])
+        base_color = color_map.get(ghost_data.get('color', 'red'), COLORS['ghost_red'])
+        color = COLORS['ghost_blue'] if frightened else base_color
         
         # Draw classic ghost shape
-        self._draw_classic_ghost(surface, x, y, color, GHOST_RADIUS)
+        self._draw_classic_ghost(surface, x, y, color, GHOST_RADIUS, velocity=velocity, frightened=frightened)
     
-    def _draw_classic_ghost(self, surface, x, y, color, radius):
-        """Draw a classic Pac-Man ghost shape"""
+    def _draw_classic_ghost(self, surface, x, y, color, radius, velocity=(0,0), frightened=False):
+        """Draw a classic Pac-Man ghost shape with eye tracking and frightened mode"""
         # Ghost body - rounded top, flat bottom with wave pattern
         
-        # Draw the rounded top part (semi-circle)
-        top_rect = pygame.Rect(x - radius, y - radius, radius * 2, radius * 2)
+        # Body
         pygame.draw.rect(surface, color, pygame.Rect(x - radius, y - radius//2, radius * 2, radius + radius//2))
         pygame.draw.circle(surface, color, (x, y - radius//2), radius)
         
-        # Draw wavy bottom
+        # Wavy bottom
         bottom_y = y + radius//2
         wave_points = []
-        
-        # Create wave pattern
         num_waves = 4
         wave_width = (radius * 2) // num_waves
-        
         for i in range(num_waves + 1):
             wave_x = x - radius + (i * wave_width)
-            if i % 2 == 0:
-                wave_y = bottom_y
-            else:
-                wave_y = bottom_y + 6
+            wave_y = bottom_y if i % 2 == 0 else bottom_y + 6
             wave_points.append((wave_x, wave_y))
-        
-        # Complete the ghost shape
         ghost_points = [
-            (x - radius, y - radius//2),  # Top left
-            (x - radius, bottom_y)        # Bottom left
+            (x - radius, y - radius//2),
+            (x - radius, bottom_y)
         ]
         ghost_points.extend(wave_points)
-        ghost_points.append((x + radius, bottom_y))  # Bottom right
-        ghost_points.append((x + radius, y - radius//2))  # Top right
-        
+        ghost_points.append((x + radius, bottom_y))
+        ghost_points.append((x + radius, y - radius//2))
         pygame.draw.polygon(surface, color, ghost_points)
-        
-        # Draw the rounded top
         pygame.draw.circle(surface, color, (x, y - radius//2), radius)
         
-        # Draw classic ghost eyes
+        # Eyes with pupil offset toward velocity
         eye_radius = 4
         pupil_radius = 2
-        
-        # Left eye
         left_eye_x, left_eye_y = x - 6, y - 8
-        pygame.draw.circle(surface, (255, 255, 255), (left_eye_x, left_eye_y), eye_radius)
-        pygame.draw.circle(surface, (0, 0, 0), (left_eye_x, left_eye_y), pupil_radius)
-        
-        # Right eye
         right_eye_x, right_eye_y = x + 6, y - 8
+        pygame.draw.circle(surface, (255, 255, 255), (left_eye_x, left_eye_y), eye_radius)
         pygame.draw.circle(surface, (255, 255, 255), (right_eye_x, right_eye_y), eye_radius)
-        pygame.draw.circle(surface, (0, 0, 0), (right_eye_x, right_eye_y), pupil_radius)
         
-        # Add a subtle outline for better visibility
+        vx, vy = velocity
+        # Normalize and clamp pupil offset
+        mag = max(1.0, (abs(vx) + abs(vy)) * 8.0)
+        px = int(max(-2, min(2, (vx / mag) * 6)))
+        py = int(max(-2, min(2, (vy / mag) * 6)))
+        pygame.draw.circle(surface, (0, 0, 0), (left_eye_x + px, left_eye_y + py), pupil_radius)
+        pygame.draw.circle(surface, (0, 0, 0), (right_eye_x + px, right_eye_y + py), pupil_radius)
+        
+        # Outline for visibility
         pygame.draw.circle(surface, (0, 0, 0), (x, y - radius//2), radius, 1)
 
     def draw_ui(self, surface, data):
@@ -268,10 +264,16 @@ class SimpleGameClient:
         
         y_offset = 20
         
-        # Title
+        # Title & High Score
         title = font_large.render("PAC-MAN", True, COLORS['ui_text'])
         surface.blit(title, (ui_x, y_offset))
-        y_offset += 40
+        y_offset += 30
+        # High score (max of current players)
+        players = data.get('players', {})
+        high = max([p.get('score', 0) for p in players.values()], default=0)
+        hi_text = font_small.render(f"HIGH SCORE: {high}", True, (255, 64, 64))
+        surface.blit(hi_text, (ui_x, y_offset))
+        y_offset += 20
         
         # Room Information
         if self.room_id:
@@ -473,8 +475,20 @@ class SimpleGameClient:
             
             # Draw ghosts
             ghosts = data.get('ghosts', [])
-            for ghost_data in ghosts:
-                self.draw_ghost(self.screen, ghost_data)
+            # Determine frightened state if any player has power
+            players = data.get('players', {})
+            frightened = any(p.get('power', 0) > 0 for p in players.values())
+            # Track previous positions to infer velocity for eyes
+            if not hasattr(self, 'prev_ghost_positions') or len(self.prev_ghost_positions) != len(ghosts):
+                self.prev_ghost_positions = [(g.get('x', 0), g.get('y', 0)) for g in ghosts]
+            new_positions = []
+            for idx, ghost_data in enumerate(ghosts):
+                gx, gy = ghost_data.get('x', 0), ghost_data.get('y', 0)
+                pgx, pgy = self.prev_ghost_positions[idx] if idx < len(self.prev_ghost_positions) else (gx, gy)
+                vx, vy = (gx - pgx, gy - pgy)
+                self.draw_ghost(self.screen, ghost_data, frightened=frightened, velocity=(vx, vy))
+                new_positions.append((gx, gy))
+            self.prev_ghost_positions = new_positions
             
             # Draw UI
             self.draw_ui(self.screen, data)
@@ -488,15 +502,102 @@ class SimpleGameClient:
             pygame.display.flip()
             self.clock.tick(60)
 
+    def _gen_token(self, length=6):
+        alpha = string.ascii_uppercase + string.digits
+        return ''.join(random.choice(alpha) for _ in range(length))
+
+    def _menu_loop(self):
+        """Simple text-driven menu for Host/Join with token input"""
+        font_large = pygame.font.Font(None, 48)
+        font_medium = pygame.font.Font(None, 28)
+        font_small = pygame.font.Font(None, 22)
+        token_input = ""
+        mode = None  # None | "host" | "join" | "ready"
+        generated_token = None
+        blink = True
+        blink_timer = 0
+
+        while True:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    return None
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        return None
+                    if mode is None:
+                        if event.key == pygame.K_h:
+                            mode = "host"
+                            generated_token = self._gen_token(6)
+                        elif event.key == pygame.K_j:
+                            mode = "join"
+                            token_input = ""
+                    else:
+                        if mode == "host":
+                            if event.key == pygame.K_RETURN:
+                                return ("create", generated_token)
+                        elif mode == "join":
+                            if event.key == pygame.K_RETURN and token_input:
+                                return ("join", token_input.upper())
+                            elif event.key == pygame.K_BACKSPACE:
+                                token_input = token_input[:-1]
+                            else:
+                                ch = event.unicode.upper()
+                                if ch and ch in (string.ascii_letters + string.digits):
+                                    if len(token_input) < 10:
+                                        token_input += ch
+            # draw
+            self.screen.fill((0,0,0))
+            title = font_large.render("PAC-MAN", True, (255,255,0))
+            self.screen.blit(title, (40, 40))
+
+            menu_text = [
+                "Press H to Host Game",
+                "Press J to Join Game",
+                "ESC to Exit"
+            ]
+            for i, line in enumerate(menu_text):
+                s = font_medium.render(line, True, (255,255,255))
+                self.screen.blit(s, (40, 120 + i*30))
+
+            if mode == "host":
+                t1 = font_medium.render("ROOM KEY (share with friend):", True, (0, 255, 255))
+                self.screen.blit(t1, (40, 240))
+                t2 = font_large.render(generated_token, True, (255, 255, 255))
+                self.screen.blit(t2, (40, 280))
+                hint = font_small.render("Press Enter to start", True, (200, 200, 200))
+                self.screen.blit(hint, (40, 340))
+            elif mode == "join":
+                t1 = font_medium.render("ENTER ROOM KEY:", True, (0, 255, 255))
+                self.screen.blit(t1, (40, 240))
+                show = token_input + ("_" if blink else "")
+                t2 = font_large.render(show, True, (255,255,255))
+                self.screen.blit(t2, (40, 280))
+                hint = font_small.render("Type and press Enter", True, (200,200,200))
+                self.screen.blit(hint, (40, 340))
+
+            pygame.display.flip()
+            self.clock.tick(30)
+            blink_timer += 1
+            if blink_timer % 15 == 0:
+                blink = not blink
+
     async def run(self):
         """Main run method"""
         if not self.init_display():
             return
         
-        print(f"Connecting to {self.server_url}...")
+        # Menu to choose host/join and token
+        choice = self._menu_loop()
+        if choice is None:
+            pygame.quit()
+            return
+        action, token = choice  # "create" or "join"
+        connect_url = f"{self.server_url}?action={action}&room={token}"
+        print(f"Connecting to {connect_url}...")
         
+        started_lb = False
         try:
-            async with websockets.connect(self.server_url) as websocket:
+            async with websockets.connect(connect_url, open_timeout=3) as websocket:
                 self.current_player_id = id(websocket)
                 print(f"Connected to server!")
                 
@@ -513,10 +614,30 @@ class SimpleGameClient:
                 for task in pending:
                     task.cancel()
                 
-        except ConnectionRefusedError:
-            print(f"Could not connect to server at {self.server_url}")
-        except OSError as e:
-            print(f"Network error: {e}")
+        except (ConnectionRefusedError, OSError) as e:
+            if not started_lb:
+                print("Server not reachable. Starting local load balancer with autoscale...")
+                # Start LB with autoscale and at least one backend
+                try:
+                    subprocess.Popen(
+                        ["python", "-m", "server.load_balancer", "--port", "8765", "--auto", "--min-backends", "1", "--max-backends", "3", "--backend-base-port", "8766"],
+                        shell=False,
+                    )
+                    time.sleep(2)
+                    started_lb = True
+                    # Retry once
+                    async with websockets.connect(connect_url, open_timeout=5) as websocket:
+                        self.current_player_id = id(websocket)
+                        print(f"Connected to server!")
+                        input_task = asyncio.create_task(self.handle_input(websocket))
+                        game_task = asyncio.create_task(self.game_loop(websocket))
+                        done, pending = await asyncio.wait([input_task, game_task], return_when=asyncio.FIRST_COMPLETED)
+                        for task in pending:
+                            task.cancel()
+                except Exception as e2:
+                    print(f"Auto-start failed: {e2}")
+            else:
+                print(f"Network error after auto-start: {e}")
         except Exception as e:
             print(f"Error: {e}")
         finally:

@@ -62,6 +62,37 @@ class RoomManager:
             return available_room.room_id
         
         return None
+
+    async def add_player_to_specific_room(self, websocket, room_id: str, create_if_missing: bool = True) -> Optional[str]:
+        """Add a player to a specific room by ID. Optionally create if missing.
+        Returns room_id on success, None on failure (e.g., room full or not found and create disabled).
+        """
+        player_id = id(websocket)
+        
+        # If already tracked, return existing room
+        if player_id in self.player_to_room:
+            return self.player_to_room[player_id]
+        
+        room = self.rooms.get(room_id)
+        if room is None and create_if_missing:
+            room = GameRoom(room_id)
+            self.rooms[room_id] = room
+            print(f"Created room with token: {room_id}")
+        
+        if room is None:
+            return None
+        
+        if room.is_full():
+            print(f"Room {room_id} is full")
+            return None
+        
+        success = await room.add_player(websocket)
+        if success:
+            self.player_to_room[player_id] = room.room_id
+            print(f"Player {player_id} joined room {room.room_id}")
+            print(f"Room {room.room_id} now has {len(room.players)} players")
+            return room.room_id
+        return None
     
     async def remove_player_from_room(self, websocket):
         """Remove a player from their room"""

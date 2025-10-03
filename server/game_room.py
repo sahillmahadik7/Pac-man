@@ -18,7 +18,7 @@ class GameRoom:
     ROWS = 15
     COLS = 19
     PLAYER_SPEED = 0.2
-    GHOST_SPEED = 0.15  # Further increased for more visible movement
+    GHOST_SPEED = 0.12  # Tile-oriented movement speed for smoother, classic behavior
     PLAYER_RADIUS = 15
     GHOST_RADIUS = 15
     PELLET_RADIUS = 4
@@ -54,6 +54,11 @@ class GameRoom:
         self.running = False
         self.game_loop_task = None
         self.created_at = time.time()
+        # Global chase/scatter mode
+        self.mode = "scatter"
+        self.mode_timer = 0
+        self.CHASE_STEPS = 7 * 20     # ~7 seconds at 20 FPS
+        self.SCATTER_STEPS = 5 * 20   # ~5 seconds at 20 FPS
         
     def _initialize_ghosts(self):
         """Initialize ghosts for this room"""
@@ -76,6 +81,7 @@ class GameRoom:
                 self.behavior_change_timer = 0
                 self.current_behavior = behavior
                 self.randomness_factor = random.uniform(0.3, 0.8)
+                self.change_interval = random.randint(10, 40)  # more frequent direction changes
                 
             def snap_to_grid(self):
                 grid_x = round(self.x)
@@ -94,12 +100,24 @@ class GameRoom:
             Ghost(9 + random.uniform(-0.2, 0.2), 8 + random.uniform(-0.2, 0.2), "random", "green")
         ]
         
-        # Initialize ghosts with proper starting directions
+        # Initialize ghosts with proper starting directions and scatter corners
         for i, ghost in enumerate(ghosts):
-            # Give each ghost a different starting direction
             directions = [(1, 0), (-1, 0), (0, 1), (0, -1)]  # right, left, down, up
             ghost.dx, ghost.dy = directions[i % 4]
             ghost.mode_timer = i * 10  # Stagger their behavior updates
+            # Scatter targets (corners)
+            top_left = (1, 1)
+            top_right = (self.COLS - 2, 1)
+            bottom_left = (1, self.ROWS - 2)
+            bottom_right = (self.COLS - 2, self.ROWS - 2)
+            if ghost.color == "red":  # Blinky
+                ghost.scatter_x, ghost.scatter_y = top_right
+            elif ghost.color == "purple":  # Pinky
+                ghost.scatter_x, ghost.scatter_y = top_left
+            elif ghost.color == "green":  # Inky
+                ghost.scatter_x, ghost.scatter_y = bottom_right
+            else:  # orange -> Clyde
+                ghost.scatter_x, ghost.scatter_y = bottom_left
         
         return ghosts
     
@@ -261,109 +279,53 @@ class GameRoom:
                     player["power"] = self.POWER_TIME
     
     def _update_ghosts(self):
-        """Update ghost AI and movement - Fixed movement system"""
+        """Tile-aware ghost movement with classic chase/scatter and frightened behavior"""
+        # Determine if frightened mode is active (any player powered)
+        frightened = any(p.get("power", 0) > 0 for p in self.players.values())
+        
+        # Update global mode timer when not frightened
+        if not frightened:
+            self.mode_timer += 1
+            if self.mode == "scatter" and self.mode_timer >= self.SCATTER_STEPS:
+                self.mode = "chase"
+                self.mode_timer = 0
+            elif self.mode == "chase" and self.mode_timer >= self.CHASE_STEPS:
+                self.mode = "scatter"
+                self.mode_timer = 0
+        
         for ghost in self.ghosts:
-            self._update_ghost_behavior(ghost)
+            # Choose direction at tile centers or when blocked
+            if self._at_tile_center(ghost.x, ghost.y):
+                self._choose_ghost_direction(ghost, frightened)
             
-            # Simple but effective movement
+            # Move along current direction
             new_x = ghost.x + ghost.dx * self.GHOST_SPEED
             new_y = ghost.y + ghost.dy * self.GHOST_SPEED
             
-            # Ensure ghosts stay within bounds
-            new_x = max(0.5, min(self.COLS - 0.5, new_x))
-            new_y = max(0.5, min(self.ROWS - 0.5, new_y))
+            # Horizontal tunnel wrap if open
+            gy = int(round(ghost.y))
+            if 0 <= gy < self.ROWS:
+                left_open = self.maze[gy][0] == 0
+                right_open = self.maze[gy][self.COLS - 1] == 0
+                if left_open and ghost.dx < 0 and new_x <= 0.4:
+                    new_x = self.COLS - 0.6
+                if right_open and ghost.dx > 0 and new_x >= self.COLS - 0.4:
+                    new_x = 0.6
             
-            # Check if movement is valid
+            # Apply movement if valid, else force a new direction (allow reverse as last resort)
             if self.can_move(new_x, new_y):
                 ghost.x, ghost.y = new_x, new_y
             else:
-                # If blocked, choose a new random direction
-                valid_dirs = self._get_valid_directions_simple(ghost.x, ghost.y)
-                if valid_dirs:
-                    ghost.dx, ghost.dy = random.choice(valid_dirs)
-                    # Try moving in new direction immediately
-                    new_x = ghost.x + ghost.dx * self.GHOST_SPEED
-                    new_y = ghost.y + ghost.dy * self.GHOST_SPEED
-                    new_x = max(0.5, min(self.COLS - 0.5, new_x))
-                    new_y = max(0.5, min(self.ROWS - 0.5, new_y))
-                    if self.can_move(new_x, new_y):
-                        ghost.x, ghost.y = new_x, new_y
+                # pick new direction immediately
+                self._choose_ghost_direction(ghost, frightened, force=True)
+                new_x2 = ghost.x + ghost.dx * self.GHOST_SPEED
+                new_y2 = ghost.y + ghost.dy * self.GHOST_SPEED
+                if self.can_move(new_x2, new_y2):
+                    ghost.x, ghost.y = new_x2, new_y2
     
     def _update_ghost_behavior(self, ghost):
-        """Simplified ghost AI that ensures movement"""
-        ghost.mode_timer += 1
-        ghost.behavior_change_timer += 1
-        
-        # Ensure ghosts always have a direction
-        if ghost.dx == 0 and ghost.dy == 0:
-            ghost.dx = 1  # Start moving right
-            ghost.dy = 0
-        
-        # Force movement check - if ghost hasn't moved in 5 updates, pick new direction
-        if not hasattr(ghost, 'last_position'):
-            ghost.last_position = (ghost.x, ghost.y)
-            ghost.stuck_counter = 0
-        
-        current_pos = (round(ghost.x, 2), round(ghost.y, 2))
-        if current_pos == ghost.last_position:
-            ghost.stuck_counter += 1
-        else:
-            ghost.stuck_counter = 0
-            ghost.last_position = current_pos
-        
-        # If stuck for too long, force a direction change
-        if ghost.stuck_counter > 5:
-            valid_dirs = self._get_valid_directions_simple(ghost.x, ghost.y)
-            if valid_dirs:
-                ghost.dx, ghost.dy = random.choice(valid_dirs)
-                ghost.stuck_counter = 0
-            else:
-                # If no valid directions, try to move in any direction slightly
-                ghost.dx = random.choice([-1, 1])
-                ghost.dy = random.choice([-1, 1])
-        
-        # Change direction more frequently for better movement visibility
-        if ghost.mode_timer % random.randint(20, 80) == 0:  # Change direction every 1-4 seconds
-            valid_dirs = self._get_valid_directions_simple(ghost.x, ghost.y)
-            
-            if valid_dirs:
-                # Find target if players exist
-                target_x, target_y = ghost.x, ghost.y
-                if self.players:
-                    alive_players = [p for p in self.players.values() if not p["dead"]]
-                    if alive_players:
-                        closest_player = min(alive_players, 
-                                           key=lambda p: self._distance(ghost.x, ghost.y, p["x"], p["y"]))
-                        
-                        players_powered = any(p.get("power", 0) > 0 for p in alive_players)
-                        
-                        if players_powered:
-                            # Run away from players when they have power
-                            target_x = ghost.x + (ghost.x - closest_player["x"])
-                            target_y = ghost.y + (ghost.y - closest_player["y"])
-                        else:
-                            # Chase players normally
-                            if random.random() < 0.6:  # 60% chance to chase
-                                target_x, target_y = closest_player["x"], closest_player["y"]
-                
-                # Choose best direction towards target
-                best_dir = None
-                best_dist = float('inf')
-                
-                for dx, dy in valid_dirs:
-                    test_x = ghost.x + dx
-                    test_y = ghost.y + dy
-                    dist = self._distance(test_x, test_y, target_x, target_y)
-                    
-                    if dist < best_dist:
-                        best_dist = dist
-                        best_dir = (dx, dy)
-                
-                if best_dir:
-                    ghost.dx, ghost.dy = best_dir
-                else:
-                    # Fallback: pick any valid direction
-                    ghost.dx, ghost.dy = random.choice(valid_dirs)
+        """Deprecated: direction choice handled in _choose_ghost_direction"""
+        return
     
     def _get_valid_directions(self, x, y):
         """Get valid movement directions (legacy)"""
@@ -392,17 +354,94 @@ class GameRoom:
         return directions
     
     def _get_valid_directions_simple(self, x, y):
-        """Get valid movement directions for ghosts (simplified)"""
+        """Get valid movement directions for ghosts (immediate tile check)"""
         directions = []
         moves = [(-1, 0), (1, 0), (0, -1), (0, 1)]  # LEFT, RIGHT, UP, DOWN
-        
+        cx, cy = int(round(x)), int(round(y))
         for dx, dy in moves:
-            test_x = x + dx * self.GHOST_SPEED * 3  # Look ahead a bit
-            test_y = y + dy * self.GHOST_SPEED * 3
-            if self.can_move(test_x, test_y):
+            nx, ny = cx + dx, cy + dy
+            if 0 <= nx < self.COLS and 0 <= ny < self.ROWS and self.maze[ny][nx] != 1:
                 directions.append((dx, dy))
-        
         return directions
+
+    def _at_tile_center(self, x, y):
+        return abs(x - round(x)) < 0.1 and abs(y - round(y)) < 0.1
+
+    def _ghost_target_tile(self, ghost, frightened: bool):
+        # Compute target tile based on mode and ghost type
+        alive_players = [p for p in self.players.values() if not p["dead"]]
+        if not alive_players:
+            return (ghost.scatter_x, ghost.scatter_y)
+        # choose primary target player (closest)
+        closest = min(alive_players, key=lambda p: self._distance(ghost.x, ghost.y, p["x"], p["y"]))
+        px, py = closest["x"], closest["y"]
+        pdir = closest.get("direction")
+        # frightened: run to scatter target opposite of player
+        if frightened:
+            # Flee away from nearest player
+            fx = ghost.x + (ghost.x - px) * 2
+            fy = ghost.y + (ghost.y - py) * 2
+            return (int(round(fx)), int(round(fy)))
+        # Scatter mode
+        if self.mode == "scatter":
+            return (ghost.scatter_x, ghost.scatter_y)
+        # Chase mode behaviors
+        if ghost.color == "red":  # Blinky - direct chase
+            return (int(round(px)), int(round(py)))
+        elif ghost.color == "purple":  # Pinky - aim 4 tiles ahead of player
+            dx, dy = 0, 0
+            if pdir == "UP":
+                dx, dy = 0, -1
+            elif pdir == "DOWN":
+                dx, dy = 0, 1
+            elif pdir == "LEFT":
+                dx, dy = -1, 0
+            elif pdir == "RIGHT":
+                dx, dy = 1, 0
+            return (int(round(px + 4*dx)), int(round(py + 4*dy)))
+        elif ghost.color == "green":  # Inky - use vector from red to two tiles ahead of player
+            red = next((g for g in self.ghosts if getattr(g, 'color', '') == 'red'), None)
+            if red is None:
+                return (int(round(px)), int(round(py)))
+            # point two tiles ahead of player
+            ax, ay = px, py
+            if pdir == "UP":
+                ay -= 2
+            elif pdir == "DOWN":
+                ay += 2
+            elif pdir == "LEFT":
+                ax -= 2
+            elif pdir == "RIGHT":
+                ax += 2
+            vx = (ax - red.x) * 2
+            vy = (ay - red.y) * 2
+            return (int(round(red.x + vx)), int(round(red.y + vy)))
+        else:  # orange - Clyde: chase when far, scatter when near
+            dist = self._distance(ghost.x, ghost.y, px, py)
+            if dist > 8:
+                return (int(round(px)), int(round(py)))
+            return (ghost.scatter_x, ghost.scatter_y)
+
+    def _choose_ghost_direction(self, ghost, frightened: bool, force: bool = False):
+        cx, cy = int(round(ghost.x)), int(round(ghost.y))
+        valid_dirs = self._get_valid_directions_simple(cx, cy)
+        if not valid_dirs:
+            return
+        reverse = (-ghost.dx, -ghost.dy)
+        candidates = [d for d in valid_dirs if d != reverse] or valid_dirs if force else [d for d in valid_dirs if d != reverse] or valid_dirs
+        target = self._ghost_target_tile(ghost, frightened)
+        # Choose direction minimizing distance to target (maximize when frightened)
+        best_dir = None
+        best_score = None
+        for dx, dy in candidates:
+            nx, ny = cx + dx, cy + dy
+            dist = self._distance(nx, ny, target[0], target[1])
+            score = -dist if frightened else -dist  # frightened still tries to move away via target far away
+            if best_score is None or score > best_score:
+                best_score = score
+                best_dir = (dx, dy)
+        if best_dir:
+            ghost.dx, ghost.dy = best_dir
     
     def _distance(self, x1, y1, x2, y2):
         """Calculate distance between two points"""
