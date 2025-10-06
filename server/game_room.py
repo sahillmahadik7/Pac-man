@@ -192,8 +192,11 @@ class GameRoom:
             if key in {"UP", "DOWN", "LEFT", "RIGHT", "RESTART"}:
                 if action == "press":
                     if key == "RESTART":
+                        # Allow restart when player is dead OR after victory
                         if self.players[player_id]["dead"]:
                             await self._reset_player(player_id)
+                        elif self._check_victory():
+                            await self._reset_room()
                     else:
                         self.players[player_id]["keys"].add(key)
                 else:
@@ -446,6 +449,29 @@ class GameRoom:
     def _distance(self, x1, y1, x2, y2):
         """Calculate distance between two points"""
         return math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+
+    async def _reset_room(self):
+        """Reset the entire room after victory or on demand"""
+        # Reset maze and game tick
+        self.maze = copy.deepcopy(self.ORIGINAL_MAZE)
+        self.game_tick = 0
+        self.mode = "scatter"
+        self.mode_timer = 0
+        # Reset ghosts
+        self.ghosts = self._initialize_ghosts()
+        # Reset all players to starting positions and clear status
+        start_positions = [(1.0, 1.0), (17.0, 13.0)]
+        for i, (pid, player) in enumerate(self.players.items()):
+            start_pos = start_positions[i % len(start_positions)]
+            player["x"] = start_pos[0]
+            player["y"] = start_pos[1]
+            player["target_x"] = start_pos[0]
+            player["target_y"] = start_pos[1]
+            player["score"] = 0
+            player["dead"] = False
+            player["power"] = 0
+            player["direction"] = None
+            player["keys"] = set()
     
     def _check_player_death(self):
         """Check for player-ghost collisions"""

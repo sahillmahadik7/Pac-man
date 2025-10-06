@@ -45,6 +45,7 @@ class SimpleGameClient:
         self.connection_status = "Connecting..."
         self.app_state = "menu"  # menu | game
         self.menu_choice = None   # (action, token)
+        self.victory = False
 
     def init_display(self):
         """Initialize display"""
@@ -386,6 +387,39 @@ class SimpleGameClient:
         surface.blit(score_text, (screen_center_x - score_text.get_width() // 2, screen_center_y - 10))
         surface.blit(restart_text, (screen_center_x - restart_text.get_width() // 2, screen_center_y + 40))
 
+    def draw_victory_menu(self, surface, data):
+        """Draw a post-victory menu with scores and options"""
+        if not data:
+            return
+        overlay = pygame.Surface((CELL_SIZE * 19, CELL_SIZE * 15))
+        overlay.set_alpha(180)
+        overlay.fill((0, 0, 0))
+        surface.blit(overlay, (0, 0))
+
+        font_title = pygame.font.Font(None, 56)
+        font_medium = pygame.font.Font(None, 28)
+        font_small = pygame.font.Font(None, 22)
+
+        # Title
+        title = font_title.render("VICTORY!", True, COLORS['power_pellet'])
+        center_x = (CELL_SIZE * 19) // 2
+        center_y = (CELL_SIZE * 15) // 2
+        surface.blit(title, (center_x - title.get_width() // 2, center_y - 120))
+
+        # Scores list
+        players = data.get('players', {})
+        y = center_y - 60
+        for i, (pid, p) in enumerate(players.items()):
+            line = font_medium.render(f"Player {i+1}: {p.get('score', 0)}", True, COLORS['ui_text'])
+            surface.blit(line, (center_x - line.get_width() // 2, y))
+            y += 30
+
+        # Options
+        opt1 = font_medium.render("Press R to Restart", True, (100, 255, 100))
+        opt2 = font_medium.render("Press ESC to Exit", True, (255, 100, 100))
+        surface.blit(opt1, (center_x - opt1.get_width() // 2, y + 30))
+        surface.blit(opt2, (center_x - opt2.get_width() // 2, y + 60))
+
     async def handle_input(self, websocket):
         """Handle input"""
         keys_held = set()
@@ -399,6 +433,15 @@ class SimpleGameClient:
                     if event.key == pygame.K_ESCAPE:
                         return False
                     
+                    # During victory, only accept Restart (R)
+                    if self.victory:
+                        if event.key == pygame.K_r:
+                            try:
+                                await websocket.send(json.dumps({"key": "RESTART", "action": "press"}))
+                            except websockets.ConnectionClosed:
+                                return False
+                        continue
+
                     key_map = {
                         pygame.K_UP: "UP",
                         pygame.K_DOWN: "DOWN",
@@ -417,6 +460,8 @@ class SimpleGameClient:
                                 return False
                 
                 elif event.type == pygame.KEYUP:
+                    if self.victory:
+                        continue  # ignore movement releases during victory screen
                     key_map = {
                         pygame.K_UP: "UP",
                         pygame.K_DOWN: "DOWN",
@@ -459,6 +504,10 @@ class SimpleGameClient:
                 print(f"Game loop error: {e}")
                 break
             
+            # Update victory state from server
+            game_stats = data.get('game_stats', {})
+            self.victory = bool(game_stats.get('victory', False))
+            
             # Clear screen
             self.screen.fill(COLORS['background'])
             
@@ -493,10 +542,13 @@ class SimpleGameClient:
             # Draw UI
             self.draw_ui(self.screen, data)
             
-            # Draw death overlay
-            current_player = players.get(self.current_player_id)
-            if current_player:
-                self.draw_death_overlay(self.screen, current_player)
+            # Draw victory overlay or death overlay
+            if self.victory:
+                self.draw_victory_menu(self.screen, data)
+            else:
+                current_player = players.get(self.current_player_id)
+                if current_player:
+                    self.draw_death_overlay(self.screen, current_player)
             
             # Update display
             pygame.display.flip()
