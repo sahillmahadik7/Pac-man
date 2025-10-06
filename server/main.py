@@ -46,10 +46,33 @@ async def handle_client(websocket, path=None):
             "message": f"Assigned to room {room_id}"
         }))
         
+# Rate limiting config
+        RATE = float(os.getenv("PACMAN_INPUT_RPS", "30"))
+        BURST = float(os.getenv("PACMAN_INPUT_BURST", "10"))
+        tokens = BURST
+        last_refill = asyncio.get_event_loop().time()
+        warn_cooldown = 0.0
+
         # Handle messages from the client
         async for message in websocket:
             try:
-                await room_manager.handle_player_input(websocket, message)
+                # Refill token bucket
+                now = asyncio.get_event_loop().time()
+                elapsed = now - last_refill
+                last_refill = now
+                tokens = min(BURST, tokens + elapsed * RATE)
+                if tokens >= 1.0:
+                    tokens -= 1.0
+                    await room_manager.handle_player_input(websocket, message)
+                else:
+                    # Drop excess input and occasionally warn
+                    if now >= warn_cooldown:
+                        print("[RateLimit] Dropping input from client due to rate limit")
+                        try:
+                            await websocket.send(json.dumps({"type": "rate_limit", "message": "Too many inputs; slowing down."}))
+                        except Exception:
+                            pass
+                        warn_cooldown = now + 1.0  # warn at most once per second
             except json.JSONDecodeError:
                 print("Invalid JSON received from client")
             except Exception as e:

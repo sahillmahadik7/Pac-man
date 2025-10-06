@@ -36,9 +36,10 @@ class Backend:
 
 
 class BackendPool:
-    def __init__(self, backends: List[str]):
+    def __init__(self, backends: List[str], capacity: int = 0):
         self.backends = [Backend(url) for url in backends]
         self._lock = asyncio.Lock()
+        self.capacity = capacity
 
     async def pick_backend(self) -> Optional[Backend]:
         """Least-connections selection among available backends"""
@@ -109,6 +110,16 @@ async def handle_client(websocket: websockets.WebSocketServerProtocol, path: Opt
         finally:
             await websocket.close()
         return
+    
+    # Overload check: if all available backends are at/over capacity, return overload
+    now = asyncio.get_event_loop().time()
+    available = [b for b in pool.backends if b.is_available(now)]
+    if pool.capacity and available and all(b.active_connections >= pool.capacity for b in available):
+        try:
+            await websocket.send('{"error": "All servers are busy. Please try again in a moment."}')
+        finally:
+            await websocket.close()
+        return
 
     try:
         # Attempt to connect to backend
@@ -140,7 +151,7 @@ async def main():
     args = parser.parse_args()
 
     initial_backends = [b.strip() for b in args.backends.split(",") if b.strip()]
-    pool = BackendPool(initial_backends)
+    pool = BackendPool(initial_backends, capacity=args.backend_capacity)
 
     # spawning helpers
     async def spawn_backend_on_port(port: int):

@@ -568,13 +568,31 @@ class GameRoom:
             }
         })
         
+        # Initialize in-flight tracking on first use
+        if not hasattr(self, "_send_in_flight"):
+            self._send_in_flight = {}
+        
         disconnected = set()
-        for ws in list(self.clients):
+        
+        async def _send_one(ws):
             try:
                 await ws.send(payload)
             except websockets.ConnectionClosed:
                 disconnected.add(ws)
-                
+            finally:
+                self._send_in_flight.pop(ws, None)
+        
+        for ws in list(self.clients):
+            # Coalesce: if a previous send to this ws is still in flight, skip this frame for that ws
+            inflight = self._send_in_flight.get(ws)
+            if inflight and not inflight.done():
+                # Drop this frame for this client
+                # Optional: log occasionally
+                # print("[Coalesce] Skipping frame for slow client")
+                continue
+            task = asyncio.create_task(_send_one(ws))
+            self._send_in_flight[ws] = task
+        
         for ws in disconnected:
             self.clients.discard(ws)
             await self.remove_player(ws)

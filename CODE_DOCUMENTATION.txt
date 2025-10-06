@@ -14,6 +14,7 @@ TABLE OF CONTENTS:
 9. TROUBLESHOOTING GUIDE
 10. LOAD BALANCER ARCHITECTURE
 11. DISTRIBUTED CONCEPT: CIRCUIT BREAKER PATTERN
+12. DISTRIBUTED CONCEPT: BACKPRESSURE AND RATE LIMITING
 ================================================================================
 1. ARCHITECTURE OVERVIEW
 ================================================================================
@@ -1034,6 +1035,80 @@ RELATED IDEAS (OPTIONAL EXTENSIONS):
 - Sticky sessions via consistent hashing of client IDs to backends
 - Active health checks (periodic ping endpoints) to detect recovery faster
 - Outlier detection and ejection when a backend shows high error rates
+
+================================================================================
+12. DISTRIBUTED CONCEPT: BACKPRESSURE AND RATE LIMITING
+================================================================================
+
+WHAT IS IT?
+Backpressure is the mechanism by which a system signals “slow down” to its sources
+when it cannot keep up with the incoming workload. Rate limiting is a policy to cap
+throughput (requests or messages) so that services stay within safe operating bounds.
+Together, they prevent overload, reduce latency spikes, and improve stability.
+
+WHY IT MATTERS FOR REALTIME GAMES
+- Realtime constraints: Both server (20 FPS sim) and client (60 FPS render) rely on timely updates.
+  Spikes in input or broadcast volume can cause stalls or packet queues to grow uncontrollably.
+- Multi-tenant load: With many rooms and clients, one chatty/buggy client should not degrade others.
+- Protection layers: LB → Backend → Room. Each layer needs simple, localized controls.
+
+COMMON SYMPTOMS WITHOUT BACKPRESSURE
+- Unbounded memory growth from buffered messages
+- Latency cliffs (smooth → suddenly choppy) under bursty input
+- GC pauses and timeouts due to large queues
+- Disconnections from slow consumers or overwhelmed producers
+
+PATTERNS AND STRATEGIES
+1) Per-connection input rate limiting (token bucket)
+   - Maintain tokens per client (e.g., 30 input msgs/second with short burst allowance).
+   - On message: consume a token; if empty, drop or defer, optionally warn the client.
+
+2) Bounded queues with drop or shed
+   - Keep a small, bounded queue for outbound frames per connection.
+   - If the client can’t keep up, drop the oldest non-critical frames (e.g., intermediate snapshots)
+     and always keep the latest state (state is idempotent).
+
+3) Broadcast coalescing
+   - For rooms with many players, replace per-tick broadcasts with “latest only” delivery when lagging.
+   - If a client missed 3 frames, send just the most recent one.
+
+4) Load shedding at the load balancer
+   - Cap accepted concurrent connections per backend (soft capacity).
+   - When over capacity, return an overload error and suggest retry.
+
+5) Server tick budget
+   - Budget each 50ms server tick for updates + sends (e.g., ≤30ms). If exceeded, skip optional work
+     (e.g., pathfinding depth, logging), and prioritize authoritative state and essential I/O.
+
+WHERE TO APPLY IN THIS CODEBASE
+- server/game_room.py
+  - Broadcast coalescing: keep only the latest JSON snapshot per client when the send queue backs up.
+  - Tick budget: measure time spent in _update_players/_update_ghosts/_broadcast_game_state; if over budget,
+    lower AI effort or skip optional effects.
+
+- server/main.py (per-connection input)
+  - Maintain a small token bucket for each websocket to limit input spam (e.g., 30 msgs/sec, burst 10).
+
+- server/load_balancer.py
+  - Enforce an approximate capacity per backend (already present as backend_capacity for autoscale);
+    respond with a friendly overload error when all available backends are above capacity.
+
+OPERATIONAL GUIDELINES
+- Start conservative (e.g., 30 inputs/sec/client; 60 broadcasts/sec cap) and observe.
+- Emit metrics: tokens remaining, drops, queue depth, send latency percentiles.
+- Tune by room size: small rooms can allow more bursts; large rooms need stricter coalescing.
+
+EXAMPLE CONFIG IDEAS (ENV)
+- PACMAN_INPUT_RPS=30
+- PACMAN_INPUT_BURST=10
+- PACMAN_CLIENT_QUEUE_MAX=5
+- PACMAN_BROADCAST_CAP_FPS=20
+- PACMAN_BACKEND_CAPACITY=20
+
+KEY BENEFITS
+- Keeps latency predictable under bursty loads
+- Prevents a single misbehaving client from harming others
+- Allows graceful degradation instead of failure cascades
 
 ================================================================================
 END OF DOCUMENTATION
