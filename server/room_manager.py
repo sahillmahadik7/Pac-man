@@ -4,7 +4,7 @@ import time
 import uuid
 import websockets
 from typing import Dict, Optional, Set
-from game_room import GameRoom
+from .game_room import GameRoom
 
 class RoomManager:
     """Manages multiple game rooms and assigns players to available rooms"""

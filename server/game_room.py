@@ -8,47 +8,51 @@ import time
 from collections import deque
 import websockets
 
+
 class GameRoom:
     """Manages a single game instance with max 2 players"""
-    
+
     MAX_PLAYERS = 2
-    
+
     # Grid constants
     CELL_SIZE = 40
     ROWS = 15
     COLS = 19
     PLAYER_SPEED = 0.2
-    GHOST_SPEED = 0.12  # Tile-oriented movement speed for smoother, classic behavior
+    GHOST_SPEED = 0.2  # Tile-oriented movement speed for smoother, classic behavior
     PLAYER_RADIUS = 15
     GHOST_RADIUS = 15
     PELLET_RADIUS = 4
     POWER_TIME = 200
-    GRID_SNAP_THRESHOLD = 0.2
-    
+    GRID_SNAP_THRESHOLD = 0.5
+
     # Original maze template for resetting
     ORIGINAL_MAZE = [
-        [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
-        [1,3,2,2,2,2,2,2,2,1,2,2,2,2,2,2,2,3,1],
-        [1,2,1,1,2,1,1,1,2,1,2,1,1,1,2,1,1,2,1],
-        [1,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,1],
-        [1,2,1,1,2,1,2,1,1,1,1,1,2,1,2,1,1,2,1],
-        [1,2,2,2,2,1,2,2,2,1,2,2,2,1,2,2,2,2,1],
-        [1,1,1,1,2,1,1,1,0,1,0,1,1,1,2,1,1,1,1],
-        [0,0,0,1,2,1,0,0,0,0,0,0,0,1,2,1,0,0,0],
-        [1,1,1,1,2,1,0,1,1,0,1,1,0,1,2,1,1,1,1],
-        [2,2,2,2,2,0,0,1,0,0,0,1,0,0,2,2,2,2,2],
-        [1,1,1,1,2,1,0,1,1,1,1,1,0,1,2,1,1,1,1],
-        [0,0,0,1,2,1,0,0,0,0,0,0,0,1,2,1,0,0,0],
-        [1,1,1,1,2,1,1,1,0,1,0,1,1,1,2,1,1,1,1],
-        [1,2,2,2,2,2,2,2,2,1,2,2,2,2,2,2,2,2,1],
-        [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]
+        [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+        [1, 3, 2, 2, 2, 1, 2, 2, 2, 1, 2, 2, 2, 1, 2, 2, 2, 3, 1],
+        [1, 2, 1, 0, 2, 1, 2, 1, 0, 1, 0, 1, 2, 1, 2, 0, 1, 2, 1],
+        [1, 2, 2, 2, 2, 2, 2, 2, 2, 0, 2, 2, 2, 2, 2, 2, 2, 2, 1],
+        [1, 2, 1, 1, 2, 1, 2, 1, 1, 1, 1, 1, 2, 1, 2, 1, 1, 2, 1],
+        [1, 2, 2, 2, 2, 1, 2, 0, 2, 1, 2, 0, 2, 1, 2, 2, 2, 2, 1],
+        [1, 1, 1, 1, 2, 1, 1, 1, 0, 1, 0, 1, 1, 1, 2, 1, 1, 1, 1],
+        [0, 0, 0, 1, 2, 0, 0, 0, 1, 0, 0, 0, 0, 0, 2, 1, 0, 0, 0],
+        [1, 1, 1, 1, 2, 1, 0, 1, 1, 0, 1, 1, 0, 1, 2, 1, 1, 1, 1],
+        [2, 2, 2, 2, 2, 0, 0, 1, 0, 0, 0, 1, 0, 0, 2, 2, 2, 2, 2],
+        [1, 1, 1, 1, 2, 1, 0, 1, 1, 1, 1, 1, 0, 1, 2, 1, 1, 1, 1],
+        [0, 0, 0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0, 0, 0],
+        [1, 1, 1, 1, 2, 1, 1, 1, 0, 1, 0, 1, 1, 1, 2, 1, 1, 1, 1],
+        [1, 2, 2, 2, 2, 2, 2, 2, 2, 1, 2, 2, 2, 2, 2, 2, 2, 2, 1],
+        [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
     ]
-    
+
     def __init__(self, room_id):
         self.room_id = room_id
         self.players = {}  # websocket -> player data
         self.clients = set()
         self.maze = copy.deepcopy(self.ORIGINAL_MAZE)
+        # Track tile visit counts for exploration bias (helps ghosts roam the grid)
+        self.visit_counts = [
+            [0 for _ in range(self.COLS)] for _ in range(self.ROWS)]
         self.ghosts = self._initialize_ghosts()
         self.game_tick = 0
         self.running = False
@@ -59,7 +63,7 @@ class GameRoom:
         self.mode_timer = 0
         self.CHASE_STEPS = 7 * 20     # ~7 seconds at 20 FPS
         self.SCATTER_STEPS = 5 * 20   # ~5 seconds at 20 FPS
-        
+
     def _initialize_ghosts(self):
         """Initialize ghosts for this room"""
         class Ghost:
@@ -81,28 +85,34 @@ class GameRoom:
                 self.behavior_change_timer = 0
                 self.current_behavior = behavior
                 self.randomness_factor = random.uniform(0.3, 0.8)
-                self.change_interval = random.randint(10, 40)  # more frequent direction changes
-                
+                self.change_interval = random.randint(
+                    10, 40)  # more frequent direction changes
+
             def snap_to_grid(self):
                 grid_x = round(self.x)
                 grid_y = round(self.y)
-                
+
                 if abs(self.x - grid_x) < GameRoom.GRID_SNAP_THRESHOLD:
                     self.x = float(grid_x)
                 if abs(self.y - grid_y) < GameRoom.GRID_SNAP_THRESHOLD:
                     self.y = float(grid_y)
-        
+
         import random
         ghosts = [
-            Ghost(9 + random.uniform(-0.2, 0.2), 7 + random.uniform(-0.2, 0.2), "aggressive", "red"),
-            Ghost(8 + random.uniform(-0.2, 0.2), 9 + random.uniform(-0.2, 0.2), "patrol", "orange"), 
-            Ghost(10 + random.uniform(-0.2, 0.2), 9 + random.uniform(-0.2, 0.2), "ambush", "purple"),
-            Ghost(9 + random.uniform(-0.2, 0.2), 8 + random.uniform(-0.2, 0.2), "random", "green")
+            Ghost(9 + random.uniform(-0.2, 0.2), 7 +
+                  random.uniform(-0.2, 0.2), "aggressive", "red"),
+            Ghost(8 + random.uniform(-0.2, 0.2), 9 +
+                  random.uniform(-0.2, 0.2), "patrol", "orange"),
+            Ghost(10 + random.uniform(-0.2, 0.2), 9 +
+                  random.uniform(-0.2, 0.2), "ambush", "purple"),
+            Ghost(9 + random.uniform(-0.2, 0.2), 8 +
+                  random.uniform(-0.2, 0.2), "random", "green")
         ]
-        
+
         # Initialize ghosts with proper starting directions and scatter corners
         for i, ghost in enumerate(ghosts):
-            directions = [(1, 0), (-1, 0), (0, 1), (0, -1)]  # right, left, down, up
+            # right, left, down, up
+            directions = [(1, 0), (-1, 0), (0, 1), (0, -1)]
             ghost.dx, ghost.dy = directions[i % 4]
             ghost.mode_timer = i * 10  # Stagger their behavior updates
             # Scatter targets (corners)
@@ -118,77 +128,77 @@ class GameRoom:
                 ghost.scatter_x, ghost.scatter_y = bottom_right
             else:  # orange -> Clyde
                 ghost.scatter_x, ghost.scatter_y = bottom_left
-        
+
         return ghosts
-    
+
     def is_full(self):
         """Check if room is at maximum capacity"""
         return len(self.players) >= self.MAX_PLAYERS
-    
+
     def is_empty(self):
         """Check if room has no players"""
         return len(self.players) == 0
-    
+
     async def add_player(self, websocket):
         """Add a player to this room"""
         if self.is_full():
             return False
-        
+
         self.clients.add(websocket)
         player_id = id(websocket)
-        
+
         # Better starting positions for 2 players
         start_positions = [(1.0, 1.0), (17.0, 13.0)]
         start_pos = start_positions[len(self.players) % len(start_positions)]
-        
+
         self.players[player_id] = {
             "websocket": websocket,
-            "x": start_pos[0], 
-            "y": start_pos[1], 
+            "x": start_pos[0],
+            "y": start_pos[1],
             "target_x": start_pos[0],
             "target_y": start_pos[1],
-            "keys": set(), 
-            "score": 0, 
-            "dead": False, 
-            "power": 0, 
+            "keys": set(),
+            "score": 0,
+            "dead": False,
+            "power": 0,
             "direction": None,
             "name": f"Player{len(self.players)}",
             "moving": False,
             "last_move_time": 0
         }
-        
+
         # Start game loop if this is the first player
         if len(self.players) == 1 and not self.running:
             self.running = True
             self.game_loop_task = asyncio.create_task(self._game_loop())
-        
+
         return True
-    
+
     async def remove_player(self, websocket):
         """Remove a player from this room"""
         player_id = id(websocket)
         if player_id in self.players:
             del self.players[player_id]
-        
+
         self.clients.discard(websocket)
-        
+
         # Stop game loop if no players left
         if self.is_empty() and self.running:
             self.running = False
             if self.game_loop_task:
                 self.game_loop_task.cancel()
-    
+
     async def handle_input(self, websocket, message):
         """Handle input from a player in this room"""
         player_id = id(websocket)
         if player_id not in self.players:
             return
-        
+
         try:
             data = json.loads(message)
             key = data.get("key")
             action = data.get("action", "press")
-            
+
             if key in {"UP", "DOWN", "LEFT", "RIGHT", "RESTART"}:
                 if action == "press":
                     if key == "RESTART":
@@ -203,19 +213,19 @@ class GameRoom:
                     self.players[player_id]["keys"].discard(key)
         except json.JSONDecodeError:
             pass
-    
+
     def can_move(self, x, y):
         """Enhanced movement validation"""
         if not (0.3 <= x < self.COLS - 0.3 and 0.3 <= y < self.ROWS - 0.3):
             return False
-        
+
         center_x = int(round(x))
         center_y = int(round(y))
-        
+
         if 0 <= center_x < self.COLS and 0 <= center_y < self.ROWS:
             if self.maze[center_y][center_x] == 1:
                 return False
-        
+
         if abs(x - round(x)) > 0.3 or abs(y - round(y)) > 0.3:
             corners = [
                 (int(x), int(y)),
@@ -223,23 +233,23 @@ class GameRoom:
                 (int(x), int(y + 0.4)),
                 (int(x + 0.4), int(y + 0.4))
             ]
-            
+
             for cx, cy in corners:
                 if 0 <= cx < self.COLS and 0 <= cy < self.ROWS:
                     if self.maze[cy][cx] == 1:
                         return False
-        
+
         return True
-    
+
     def _update_players(self):
         """Update player positions and handle collisions"""
         for player in self.players.values():
-            if player["dead"]: 
+            if player["dead"]:
                 continue
-            
+
             current_x, current_y = player["x"], player["y"]
             target_x, target_y = current_x, current_y
-            
+
             # Determine target based on input
             if "UP" in player["keys"]:
                 target_y = current_y - self.PLAYER_SPEED
@@ -253,22 +263,22 @@ class GameRoom:
             elif "RIGHT" in player["keys"]:
                 target_x = current_x + self.PLAYER_SPEED
                 player["direction"] = "RIGHT"
-            
+
             # Apply movement if valid
             if target_x != current_x or target_y != current_y:
                 new_x = max(0.4, min(self.COLS - 0.4, target_x))
                 new_y = max(0.4, min(self.ROWS - 0.4, target_y))
-                
+
                 if self.can_move(new_x, new_y):
                     player["x"], player["y"] = new_x, new_y
-            
+
             # Snap to grid when very close (for pellet collection)
             snap_threshold = 0.15
             if abs(player["x"] - round(player["x"])) < snap_threshold:
                 player["x"] = float(round(player["x"]))
             if abs(player["y"] - round(player["y"])) < snap_threshold:
                 player["y"] = float(round(player["y"]))
-            
+
             # Pellet collection
             gx, gy = int(round(player["x"])), int(round(player["y"]))
             if 0 <= gy < self.ROWS and 0 <= gx < self.COLS:
@@ -280,12 +290,12 @@ class GameRoom:
                     self.maze[gy][gx] = 0
                     player["score"] += 50
                     player["power"] = self.POWER_TIME
-    
+
     def _update_ghosts(self):
         """Tile-aware ghost movement with classic chase/scatter and frightened behavior"""
         # Determine if frightened mode is active (any player powered)
         frightened = any(p.get("power", 0) > 0 for p in self.players.values())
-        
+
         # Update global mode timer when not frightened
         if not frightened:
             self.mode_timer += 1
@@ -295,16 +305,21 @@ class GameRoom:
             elif self.mode == "chase" and self.mode_timer >= self.CHASE_STEPS:
                 self.mode = "scatter"
                 self.mode_timer = 0
-        
+
         for ghost in self.ghosts:
             # Choose direction at tile centers or when blocked
             if self._at_tile_center(ghost.x, ghost.y):
+                # Increment visit count at current tile
+                vx, vy = int(round(ghost.x)), int(round(ghost.y))
+                if 0 <= vy < self.ROWS and 0 <= vx < self.COLS:
+                    self.visit_counts[vy][vx] = min(
+                        self.visit_counts[vy][vx] + 1, 1_000_000)
                 self._choose_ghost_direction(ghost, frightened)
-            
+
             # Move along current direction
             new_x = ghost.x + ghost.dx * self.GHOST_SPEED
             new_y = ghost.y + ghost.dy * self.GHOST_SPEED
-            
+
             # Horizontal tunnel wrap if open
             gy = int(round(ghost.y))
             if 0 <= gy < self.ROWS:
@@ -314,7 +329,7 @@ class GameRoom:
                     new_x = self.COLS - 0.6
                 if right_open and ghost.dx > 0 and new_x >= self.COLS - 0.4:
                     new_x = 0.6
-            
+
             # Apply movement if valid, else force a new direction (allow reverse as last resort)
             if self.can_move(new_x, new_y):
                 ghost.x, ghost.y = new_x, new_y
@@ -325,37 +340,39 @@ class GameRoom:
                 new_y2 = ghost.y + ghost.dy * self.GHOST_SPEED
                 if self.can_move(new_x2, new_y2):
                     ghost.x, ghost.y = new_x2, new_y2
-    
+
     def _update_ghost_behavior(self, ghost):
         """Deprecated: direction choice handled in _choose_ghost_direction"""
         return
-    
+
     def _get_valid_directions(self, x, y):
         """Get valid movement directions (legacy)"""
         directions = []
-        moves = [(-1, 0, "LEFT"), (1, 0, "RIGHT"), (0, -1, "UP"), (0, 1, "DOWN")]
-        
+        moves = [(-1, 0, "LEFT"), (1, 0, "RIGHT"),
+                 (0, -1, "UP"), (0, 1, "DOWN")]
+
         for dx, dy, direction in moves:
             new_x = x + dx * self.GHOST_SPEED * 2
             new_y = y + dy * self.GHOST_SPEED * 2
             if self.can_move(new_x, new_y):
                 directions.append((dx, dy, direction))
-        
+
         return directions
-    
+
     def _get_grid_directions(self, grid_x, grid_y):
         """Get valid grid-based directions for ghosts"""
         directions = []
-        moves = [(-1, 0, "LEFT"), (1, 0, "RIGHT"), (0, -1, "UP"), (0, 1, "DOWN")]
-        
+        moves = [(-1, 0, "LEFT"), (1, 0, "RIGHT"),
+                 (0, -1, "UP"), (0, 1, "DOWN")]
+
         for dx, dy, direction in moves:
             new_x = grid_x + dx
             new_y = grid_y + dy
             if self.can_move(new_x, new_y):
                 directions.append((dx, dy, direction))
-        
+
         return directions
-    
+
     def _get_valid_directions_simple(self, x, y):
         """Get valid movement directions for ghosts (immediate tile check)"""
         directions = []
@@ -367,6 +384,63 @@ class GameRoom:
                 directions.append((dx, dy))
         return directions
 
+    def _is_walkable_tile(self, x: int, y: int) -> bool:
+        return 0 <= x < self.COLS and 0 <= y < self.ROWS and self.maze[y][x] != 1
+
+    def _neighbors(self, x: int, y: int):
+        for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nx, ny = x + dx, y + dy
+            if self._is_walkable_tile(nx, ny):
+                yield nx, ny, dx, dy
+
+    def _nearest_walkable(self, tx: int, ty: int, max_radius: int = 5):
+        """Find the nearest walkable tile around (tx, ty) within a small radius."""
+        if self._is_walkable_tile(tx, ty):
+            return tx, ty
+        for r in range(1, max_radius + 1):
+            for dx in range(-r, r + 1):
+                for dy in range(-r, r + 1):
+                    nx, ny = tx + dx, ty + dy
+                    if self._is_walkable_tile(nx, ny):
+                        return nx, ny
+        return None
+
+    def _bfs_next_step(self, sx: int, sy: int, tx: int, ty: int, node_limit: int = 1200):
+        """Return the first step (dx, dy) on a shortest path from (sx, sy) to (tx, ty) using BFS.
+        If no path, return None. Limits explored nodes to keep it cheap.
+        """
+        if not self._is_walkable_tile(sx, sy):
+            return None
+        if not self._is_walkable_tile(tx, ty):
+            nearest = self._nearest_walkable(tx, ty)
+            if not nearest:
+                return None
+            tx, ty = nearest
+        start = (sx, sy)
+        target = (tx, ty)
+        if start == target:
+            return None
+        q = deque([start])
+        parents = {start: None}
+        explored = 0
+        while q and explored < node_limit:
+            x0, y0 = q.popleft()
+            explored += 1
+            if (x0, y0) == target:
+                break
+            for nx, ny, _, _ in self._neighbors(x0, y0):
+                if (nx, ny) not in parents:
+                    parents[(nx, ny)] = (x0, y0)
+                    q.append((nx, ny))
+        if target not in parents:
+            return None
+        # backtrack to get next step from start
+        cur = target
+        while parents[cur] is not None and parents[cur] != start:
+            cur = parents[cur]
+        nx, ny = cur
+        return (nx - sx, ny - sy)
+
     def _at_tile_center(self, x, y):
         return abs(x - round(x)) < 0.1 and abs(y - round(y)) < 0.1
 
@@ -376,7 +450,8 @@ class GameRoom:
         if not alive_players:
             return (ghost.scatter_x, ghost.scatter_y)
         # choose primary target player (closest)
-        closest = min(alive_players, key=lambda p: self._distance(ghost.x, ghost.y, p["x"], p["y"]))
+        closest = min(alive_players, key=lambda p: self._distance(
+            ghost.x, ghost.y, p["x"], p["y"]))
         px, py = closest["x"], closest["y"]
         pdir = closest.get("direction")
         # frightened: run to scatter target opposite of player
@@ -403,7 +478,8 @@ class GameRoom:
                 dx, dy = 1, 0
             return (int(round(px + 4*dx)), int(round(py + 4*dy)))
         elif ghost.color == "green":  # Inky - use vector from red to two tiles ahead of player
-            red = next((g for g in self.ghosts if getattr(g, 'color', '') == 'red'), None)
+            red = next((g for g in self.ghosts if getattr(
+                g, 'color', '') == 'red'), None)
             if red is None:
                 return (int(round(px)), int(round(py)))
             # point two tiles ahead of player
@@ -431,21 +507,72 @@ class GameRoom:
         if not valid_dirs:
             return
         reverse = (-ghost.dx, -ghost.dy)
-        candidates = [d for d in valid_dirs if d != reverse] or valid_dirs if force else [d for d in valid_dirs if d != reverse] or valid_dirs
-        target = self._ghost_target_tile(ghost, frightened)
-        # Choose direction minimizing distance to target (maximize when frightened)
-        best_dir = None
-        best_score = None
+        # Prefer not to reverse unless forced
+        non_reverse = [d for d in valid_dirs if d != reverse]
+        candidates = non_reverse or valid_dirs
+
+        # Determine a target tile and plan via BFS for better roaming
+        tx, ty = self._ghost_target_tile(ghost, frightened)
+        tx = int(max(0, min(self.COLS - 1, tx)))
+        ty = int(max(0, min(self.ROWS - 1, ty)))
+        step = self._bfs_next_step(cx, cy, tx, ty)
+
+        # At intersections, prefer less-visited tiles to encourage roaming; keep some randomness
+        is_intersection = len(candidates) >= 3 or (
+            len(candidates) == 2 and candidates[0] != (-candidates[1][0], -candidates[1][1]))
+        if is_intersection:
+            # Exploration bias stronger in scatter mode; milder in chase
+            explore_rand = 0.2 if self.mode == "chase" else 0.6
+            if random.random() < explore_rand:
+                # Pick direction that leads to the least-visited neighbor tile
+                best = []
+                best_vis = None
+                for dx, dy in candidates:
+                    nx, ny = cx + dx, cy + dy
+                    vis = self.visit_counts[ny][nx] if 0 <= ny < self.ROWS and 0 <= nx < self.COLS else 0
+                    if best_vis is None or vis < best_vis:
+                        best = [(dx, dy)]
+                        best_vis = vis
+                    elif vis == best_vis:
+                        best.append((dx, dy))
+                # Prefer BFS step if it matches one of the least-visited options
+                choice_pool = best
+                if step is not None and step in best:
+                    choice_pool = [step]
+                choice = random.choice(choice_pool)
+                if not force and choice == reverse and len(candidates) > 1:
+                    alt = [d for d in choice_pool if d != reverse] or [
+                        d for d in candidates if d != reverse]
+                    choice = random.choice(alt)
+                ghost.dx, ghost.dy = choice
+                return
+
+        # Add small randomness to avoid repetitive patterns, especially when frightened
+        if is_intersection and random.random() < (0.15 if not frightened else 0.35):
+            choice = random.choice(candidates)
+            if not force and choice == reverse and len(candidates) > 1:
+                choice = random.choice([d for d in candidates if d != reverse])
+            ghost.dx, ghost.dy = choice
+            return
+
+        if step is not None and ((step in candidates) or force):
+            ghost.dx, ghost.dy = step
+            return
+
+        # Fallback: choose the direction that gets closer to target (ties random)
+        best_choices = []
+        best_dist = None
         for dx, dy in candidates:
             nx, ny = cx + dx, cy + dy
-            dist = self._distance(nx, ny, target[0], target[1])
-            score = -dist if frightened else -dist  # frightened still tries to move away via target far away
-            if best_score is None or score > best_score:
-                best_score = score
-                best_dir = (dx, dy)
-        if best_dir:
-            ghost.dx, ghost.dy = best_dir
-    
+            dist = self._distance(nx, ny, tx, ty)
+            if best_dist is None or dist < best_dist:
+                best_choices = [(dx, dy)]
+                best_dist = dist
+            elif abs(dist - best_dist) < 1e-6:
+                best_choices.append((dx, dy))
+        if best_choices:
+            ghost.dx, ghost.dy = random.choice(best_choices)
+
     def _distance(self, x1, y1, x2, y2):
         """Calculate distance between two points"""
         return math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
@@ -472,19 +599,19 @@ class GameRoom:
             player["power"] = 0
             player["direction"] = None
             player["keys"] = set()
-    
+
     def _check_player_death(self):
         """Check for player-ghost collisions"""
         for player in self.players.values():
-            if player["dead"]: 
+            if player["dead"]:
                 continue
-                
+
             px, py = player["x"], player["y"]
             power = player.get("power", 0)
-            
+
             for ghost in self.ghosts:
                 gx, gy = ghost.x, ghost.y
-                
+
                 if self._distance(px, py, gx, gy) < 0.8:
                     if power > 0:
                         player["score"] += 200
@@ -497,21 +624,22 @@ class GameRoom:
                         ghost.current_behavior = ghost.behavior
                     else:
                         player["dead"] = True
-                        
+
             if power > 0:
                 player["power"] -= 1
-    
+
     def _check_victory(self):
         """Check for victory condition"""
         total_pellets = sum(row.count(2) + row.count(3) for row in self.maze)
         return total_pellets == 0
-    
+
     async def _reset_player(self, player_id):
         """Reset a specific player when they die"""
         if player_id in self.players:
             start_positions = [(1.0, 1.0), (17.0, 13.0)]
-            start_pos = start_positions[len(self.players) % len(start_positions)]
-            
+            start_pos = start_positions[len(
+                self.players) % len(start_positions)]
+
             player = self.players[player_id]
             player["x"] = start_pos[0]
             player["y"] = start_pos[1]
@@ -522,16 +650,16 @@ class GameRoom:
             player["power"] = 0
             player["direction"] = None
             player["keys"] = set()
-            
+
             # Reset the maze for this room
             self.maze = copy.deepcopy(self.ORIGINAL_MAZE)
-    
+
     async def _broadcast_game_state(self):
         """Broadcast game state to all clients in this room"""
         total_pellets = sum(row.count(2) + row.count(3) for row in self.maze)
         alive_players = sum(1 for p in self.players.values() if not p["dead"])
         victory = self._check_victory()
-        
+
         # Prepare player data without websocket references
         players_data = {}
         for pid, player in self.players.items():
@@ -544,17 +672,17 @@ class GameRoom:
                 "name": player.get("name", f"Player{pid}"),
                 "direction": player.get("direction")
             }
-        
+
         payload = json.dumps({
             "room_id": self.room_id,
             "players": players_data,
             "ghosts": [
                 {
-                    "x": round(g.x, 2), 
-                    "y": round(g.y, 2), 
+                    "x": round(g.x, 2),
+                    "y": round(g.y, 2),
                     "behavior": g.current_behavior,
                     "color": g.color
-                } 
+                }
                 for g in self.ghosts
             ],
             "maze": self.maze,
@@ -567,13 +695,13 @@ class GameRoom:
                 "max_players": self.MAX_PLAYERS
             }
         })
-        
+
         # Initialize in-flight tracking on first use
         if not hasattr(self, "_send_in_flight"):
             self._send_in_flight = {}
-        
+
         disconnected = set()
-        
+
         async def _send_one(ws):
             try:
                 await ws.send(payload)
@@ -581,7 +709,7 @@ class GameRoom:
                 disconnected.add(ws)
             finally:
                 self._send_in_flight.pop(ws, None)
-        
+
         for ws in list(self.clients):
             # Coalesce: if a previous send to this ws is still in flight, skip this frame for that ws
             inflight = self._send_in_flight.get(ws)
@@ -592,21 +720,21 @@ class GameRoom:
                 continue
             task = asyncio.create_task(_send_one(ws))
             self._send_in_flight[ws] = task
-        
+
         for ws in disconnected:
             self.clients.discard(ws)
             await self.remove_player(ws)
-    
+
     async def _game_loop(self):
         """Main game loop for this room"""
         try:
             while self.running and not self.is_empty():
                 self.game_tick += 1
-                
+
                 self._update_players()
                 self._update_ghosts()
                 self._check_player_death()
-                
+
                 await self._broadcast_game_state()
                 await asyncio.sleep(0.05)  # 20 FPS
         except asyncio.CancelledError:

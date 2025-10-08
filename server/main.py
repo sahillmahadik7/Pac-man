@@ -5,7 +5,7 @@ import json
 import argparse
 import os
 from urllib.parse import urlparse, parse_qs
-from room_manager import room_manager
+from .room_manager import room_manager
 
 async def handle_client(websocket, path=None):
     """Handle a new client connection. Supports token-based room create/join via query params.

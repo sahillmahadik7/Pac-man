@@ -5,6 +5,7 @@ import os
 import subprocess
 from typing import List, Optional
 from urllib.parse import urlparse, parse_qs
+import hashlib
 
 import websockets
 
@@ -20,6 +21,9 @@ class Backend:
         self.managed: bool = False
         self.process: Optional[subprocess.Popen] = None
         self.last_active: float = 0.0
+        # Room-based load balancing
+        self.active_rooms: set = set()  # Track which rooms are hosted on this server
+        self.room_player_counts: dict = {}  # room_id -> player_count
 
     def is_available(self, now: float) -> bool:
         return self.active and now >= self.cooldown_until
@@ -40,39 +44,77 @@ class BackendPool:
         self.backends = [Backend(url) for url in backends]
         self._lock = asyncio.Lock()
         self.capacity = capacity
+        # Room-to-backend mapping for consistent routing
+        self.room_to_backend: dict = {}  # room_id -> Backend
 
     async def pick_backend(self) -> Optional[Backend]:
-        """Least-connections selection among available backends"""
+        """Room-based selection: choose backend with least active rooms for new games"""
         async with self._lock:
             now = asyncio.get_event_loop().time()
             candidates = [b for b in self.backends if b.is_available(now)]
             if not candidates:
                 return None
-            # Least connections; tie-breaker: original order
-            chosen = min(candidates, key=lambda b: b.active_connections)
+            # Choose backend with least active rooms (games), not connections
+            chosen = min(candidates, key=lambda b: len(b.active_rooms))
             chosen.active_connections += 1
             chosen.last_active = now
             return chosen
 
     async def pick_backend_for_token(self, token: str) -> Optional[Backend]:
-        """Consistent selection based on token; falls back to least-connections if candidate unavailable."""
+        """Room-based consistent selection: if room exists, use same server; if new room, use least loaded server.
+        """
         async with self._lock:
             now = asyncio.get_event_loop().time()
             available = [b for b in self.backends if b.is_available(now)]
             if not available:
                 return None
-            # Deterministic index by token hash
-            idx = (hash(token) % len(self.backends)) if self.backends else 0
-            preferred = self.backends[idx]
-            candidate = preferred if preferred in available else min(available, key=lambda b: b.active_connections)
+            
+            # Check if this room already exists on any backend
+            existing_backend = self.room_to_backend.get(token)
+            if existing_backend and existing_backend in available:
+                # Room exists, route to the same server
+                existing_backend.active_connections += 1
+                existing_backend.last_active = now
+                # Increment player count for this room
+                existing_backend.room_player_counts[token] = existing_backend.room_player_counts.get(token, 0) + 1
+                print(f"[LB] Room '{token}' exists on {existing_backend.url}, routing there (players: {existing_backend.room_player_counts[token]})")
+                return existing_backend
+            
+            # New room: select backend with least active rooms
+            candidate = min(available, key=lambda b: len(b.active_rooms))
             candidate.active_connections += 1
             candidate.last_active = now
+            
+            # Track this new room assignment
+            self.room_to_backend[token] = candidate
+            candidate.active_rooms.add(token)
+            candidate.room_player_counts[token] = 1  # First player joining
+            
+            print(f"[LB] New room '{token}' assigned to {candidate.url} (active rooms: {len(candidate.active_rooms)})")
             return candidate
 
     async def release_backend(self, backend: Backend):
         async with self._lock:
             backend.active_connections = max(0, backend.active_connections - 1)
             backend.last_active = asyncio.get_event_loop().time()
+    
+    async def update_room_info(self, backend: Backend, room_id: str, player_count: int, room_active: bool):
+        """Update room information from backend servers"""
+        async with self._lock:
+            if room_active and room_id not in backend.active_rooms:
+                # New room detected
+                backend.active_rooms.add(room_id)
+                self.room_to_backend[room_id] = backend
+                print(f"[LB] Room '{room_id}' started on {backend.url}")
+            
+            if room_active:
+                backend.room_player_counts[room_id] = player_count
+            elif room_id in backend.active_rooms:
+                # Room ended or empty
+                backend.active_rooms.discard(room_id)
+                backend.room_player_counts.pop(room_id, None)
+                self.room_to_backend.pop(room_id, None)
+                print(f"[LB] Room '{room_id}' ended on {backend.url}")
 
 
 async def bidirectional_proxy(client_ws: websockets.WebSocketClientProtocol, server_ws: websockets.WebSocketClientProtocol):
@@ -93,7 +135,9 @@ async def bidirectional_proxy(client_ws: websockets.WebSocketClientProtocol, ser
 async def handle_client(websocket: websockets.WebSocketServerProtocol, path: Optional[str], pool: BackendPool):
     # Extract token from query to choose a consistent backend for that room
     token = None
-    req_path = path or getattr(websocket, "path", "")
+    # Prefer websocket.path (often includes query string) over handler's path argument
+    req_path = getattr(websocket, "path", None) or path or ""
+    # If handler path lacks query but websocket.path has it, the above covers it.
     if req_path:
         parsed = urlparse(req_path)
         qs = parse_qs(parsed.query)
@@ -111,30 +155,56 @@ async def handle_client(websocket: websockets.WebSocketServerProtocol, path: Opt
             await websocket.close()
         return
     
-    # Overload check: if all available backends are at/over capacity, return overload
+    # Room-based overload check: if all available backends are at room capacity, return overload
     now = asyncio.get_event_loop().time()
     available = [b for b in pool.backends if b.is_available(now)]
-    if pool.capacity and available and all(b.active_connections >= pool.capacity for b in available):
-        try:
-            await websocket.send('{"error": "All servers are busy. Please try again in a moment."}')
-        finally:
-            await websocket.close()
-        return
+    # Check if we're creating a new room and all servers are at room capacity
+    max_rooms_per_server = pool.capacity // 2 if pool.capacity > 0 else 10  # Assume ~2 players per room
+    if token and token not in pool.room_to_backend:  # New room
+        if available and all(len(b.active_rooms) >= max_rooms_per_server for b in available):
+            try:
+                await websocket.send('{"error": "All servers are hosting maximum rooms. Please try again later."}')
+            finally:
+                await websocket.close()
+            return
+
+    # Debug/ops log: show routing decision
+    try:
+        room_info = f" (rooms: {len(backend.active_rooms)})" if hasattr(backend, 'active_rooms') else ""
+        action = "joining existing room" if token and token in pool.room_to_backend else "creating new room" if token else "auto-assignment"
+        print(f"[LB] {action} - path='{req_path}' token='{token or 'none'}' -> {backend.url}{room_info}")
+    except Exception:
+        pass
 
     try:
         # Attempt to connect to backend
         try:
-            async with websockets.connect(backend.url, open_timeout=5) as backend_ws:
+            # Build destination URL preserving client's original path and query (e.g., ?action=join&room=TOKEN)
+            dest_url = backend.url
+            if req_path:
+                if req_path.startswith("/"):
+                    dest_url = f"{backend.url}{req_path}"
+                else:
+                    dest_url = f"{backend.url}/{req_path}"
+            async with websockets.connect(dest_url, open_timeout=5) as backend_ws:
                 backend.on_success()
                 await bidirectional_proxy(websocket, backend_ws)
-        except Exception:
+        except Exception as e:
             # Mark backend failure and close client
             backend.on_failure(asyncio.get_event_loop().time())
+            try:
+                print(f"[LB] Backend failure for token='{token or '-'}' url={backend.url}: {e}")
+            except Exception:
+                pass
             try:
                 await websocket.send('{"error": "Selected backend became unavailable. Please reconnect."}')
             finally:
                 await websocket.close()
     finally:
+        # Decrease room player count if we know which room this was for
+        if token and backend and token in backend.room_player_counts:
+            backend.room_player_counts[token] = max(0, backend.room_player_counts[token] - 1)
+            print(f"[LB] Player left room '{token}' on {backend.url} (remaining: {backend.room_player_counts[token]})")
         await pool.release_backend(backend)
 
 
@@ -194,8 +264,9 @@ async def main():
                 available = [b for b in pool.backends if b.is_available(now)]
                 if not available:
                     continue
-                # Scale up if all available backends are at/over capacity
-                if all(b.active_connections >= args.backend_capacity for b in available):
+                # Scale up if all available backends are hosting many rooms
+                max_rooms_per_server = args.backend_capacity // 2 if args.backend_capacity > 0 else 10
+                if all(len(b.active_rooms) >= max_rooms_per_server for b in available):
                     total = len(pool.backends)
                     if total < args.max_backends:
                         # find next free port
@@ -210,6 +281,45 @@ async def main():
                             next_port += 1
                         await spawn_backend_on_port(next_port)
                         print(f"Autoscale: launched backend on port {next_port}")
+        except asyncio.CancelledError:
+            pass
+
+    async def room_monitor_loop():
+        """Monitor backend servers for room state changes"""
+        if not args.auto:
+            return
+        try:
+            while True:
+                await asyncio.sleep(10)  # Check every 10 seconds
+                now = asyncio.get_event_loop().time()
+                for backend in pool.backends:
+                    if not backend.is_available(now):
+                        continue
+                    
+                    try:
+                        # Try to get room stats from backend server
+                        # This would require a separate HTTP endpoint on game servers
+                        # For now, we'll rely on connection patterns and timeouts
+                        
+                        # Clean up rooms that haven't been accessed recently
+                        stale_rooms = []
+                        for room_id in list(backend.active_rooms):
+                            # If no connections to this room recently, mark as potentially stale
+                            if backend.room_player_counts.get(room_id, 0) == 0:
+                                stale_rooms.append(room_id)
+                        
+                        # Clean up stale rooms (this is a simplified approach)
+                        for room_id in stale_rooms:
+                            if backend.room_player_counts.get(room_id, 0) == 0:
+                                backend.active_rooms.discard(room_id)
+                                backend.room_player_counts.pop(room_id, None)
+                                pool.room_to_backend.pop(room_id, None)
+                                print(f"[LB] Cleaned up stale room '{room_id}' from {backend.url}")
+                                
+                    except Exception as e:
+                        # Don't fail the entire monitor for one backend error
+                        pass
+                        
         except asyncio.CancelledError:
             pass
 
@@ -230,12 +340,14 @@ async def main():
 
     async with websockets.serve(_handler, "0.0.0.0", args.port):
         autoscale_task = asyncio.create_task(autoscale_loop())
+        room_monitor_task = asyncio.create_task(room_monitor_loop())
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
             pass
         finally:
             autoscale_task.cancel()
+            room_monitor_task.cancel()
             # Optional: stop managed backends
             for b in pool.backends:
                 if b.managed and b.process and b.process.poll() is None:
