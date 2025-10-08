@@ -20,23 +20,97 @@ async def handle_client(websocket, path=None):
         # Parse query params for token-based routing
         room_id = None
         req_path = path or getattr(websocket, "path", "")
+        action = None
+        token = None
+        action_source = "none"
+        token_source = "none"
         if req_path:
             parsed = urlparse(req_path)
             qs = parse_qs(parsed.query)
             action = (qs.get("action", [None])[0] or "").lower()
             token = (qs.get("room", [None])[0] or "").strip()
-            if action in ("create", "join") and token:
-                create_if_missing = (action == "create")
-                room_id = await room_manager.add_player_to_specific_room(websocket, token, create_if_missing=create_if_missing)
+            if action:
+                action_source = "query"
+            if token:
+                token_source = "query"
+        # Fallback to headers forwarded by the load balancer
+        try:
+            hdr_action = (websocket.request_headers.get("X-Pacman-Action") or "").lower().strip()
+            hdr_token = (websocket.request_headers.get("X-Pacman-Room") or "").strip()
+            if not action and hdr_action:
+                action = hdr_action
+                action_source = "header"
+            if not token and hdr_token:
+                token = hdr_token
+                token_source = "header"
+        except Exception:
+            pass
+
+        # Final fallback: try to read a small hello frame carrying action/token
+        first_msg_buffer = None
+        if not action or not token:
+            try:
+                raw = await asyncio.wait_for(websocket.recv(), timeout=0.75)
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    data = None
+                if isinstance(data, dict) and data.get("type") == "hello":
+                    if not action:
+                        action = (data.get("action") or "").lower().strip() or None
+                        if action:
+                            action_source = "frame"
+                    if not token:
+                        token = (data.get("room") or "").strip() or None
+                        if token:
+                            token_source = "frame"
+                else:
+                    # Not a hello message; buffer it to replay after assignment
+                    first_msg_buffer = raw
+            except Exception:
+                pass
+
+        print(f"[SVR] new connection: action='{action or '-'}' ({action_source}), token='{token or '-'}' ({token_source})")
+        if action in ("create", "join") and token:
+            create_if_missing = (action == "create")
+            force_new = False  # keep the token as-is for create
+            print(f"[SVR] handling explicit {action} for token '{token}' (force_new={force_new})")
+
+            if action == "join":
+                # Wait briefly for the host to create the room on this backend
+                max_wait = float(os.getenv("PACMAN_JOIN_WAIT_SECS", "12.0"))
+                deadline = asyncio.get_event_loop().time() + max_wait
+                room_id = None
+                while True:
+                    room_id = await room_manager.add_player_to_specific_room(
+                        websocket, token, create_if_missing=False, force_new=False
+                    )
+                    if room_id:
+                        break
+                    # If room exists but is full, abort immediately
+                    rm = room_manager.rooms.get(token)
+                    if rm is not None and rm.is_full():
+                        await websocket.send(json.dumps({"type": "error", "message": "Room is full."}))
+                        return
+                    if asyncio.get_event_loop().time() >= deadline:
+                        await websocket.send(json.dumps({"type": "error", "message": "Room not found. Ask host to start, then retry Join."}))
+                        return
+                    await asyncio.sleep(0.25)
+            else:
+                room_id = await room_manager.add_player_to_specific_room(
+                    websocket, token, create_if_missing=create_if_missing, force_new=force_new
+                )
                 if not room_id:
-                    await websocket.send(json.dumps({"type": "error", "message": "Unable to join/create the specified room."}))
+                    # Explicit create failed (should be rare): report error
+                    await websocket.send(json.dumps({"type": "error", "message": "Could not create room. Try a different code."}))
                     return
         
         # Fallback: automatic assignment
         if not room_id:
+            print("[SVR] no action/token => auto-assign path")
             room_id = await room_manager.assign_player_to_room(websocket)
         if not room_id:
-            await websocket.send(json.dumps({"error": "Failed to assign to room"}))
+            await websocket.send(json.dumps({"type": "error", "message": "Failed to assign to room"}))
             return
         
         # Send initial room assignment message
@@ -45,6 +119,13 @@ async def handle_client(websocket, path=None):
             "room_id": room_id,
             "message": f"Assigned to room {room_id}"
         }))
+
+        # If we buffered a non-hello message before assignment, process it once
+        if 'first_msg_buffer' in locals() and first_msg_buffer:
+            try:
+                await room_manager.handle_player_input(websocket, first_msg_buffer)
+            except Exception:
+                pass
         
 # Rate limiting config
         RATE = float(os.getenv("PACMAN_INPUT_RPS", "30"))

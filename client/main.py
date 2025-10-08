@@ -488,6 +488,13 @@ class SimpleGameClient:
                 message = await asyncio.wait_for(websocket.recv(), timeout=0.1)
                 data = json.loads(message)
                 
+                # Handle control/error messages
+                if (data.get("type") == "error") or (isinstance(data, dict) and "error" in data):
+                    # Stop on server error
+                    msg = data.get("message") or data.get("error") or "Unknown error"
+                    print(f"Server error: {msg}")
+                    break
+                
                 # Handle room assignment messages
                 if data.get("type") == "room_assignment":
                     self.room_id = data.get("room_id")
@@ -644,7 +651,8 @@ class SimpleGameClient:
             pygame.quit()
             return
         action, token = choice  # "create" or "join"
-        connect_url = f"{self.server_url}?action={action}&room={token}"
+        base_url = self.server_url.rstrip('/')
+        connect_url = f"{base_url}/?action={action}&room={token}"
         print(f"Connecting to {connect_url}...")
         
         started_lb = False
@@ -652,6 +660,30 @@ class SimpleGameClient:
             async with websockets.connect(connect_url, open_timeout=3) as websocket:
                 self.current_player_id = id(websocket)
                 print(f"Connected to server!")
+                
+                # Send a tiny hello so servers/LBs that can’t read query reliably can route
+                try:
+                    await websocket.send(json.dumps({"type": "hello", "action": action, "room": token}))
+                except Exception:
+                    pass
+                
+                # Expect an initial response: room_assignment or error
+                try:
+                    init_msg = await asyncio.wait_for(websocket.recv(), timeout=5)
+                    data0 = json.loads(init_msg)
+                    if (data0.get("type") == "error") or (isinstance(data0, dict) and "error" in data0):
+                        msg = data0.get("message") or data0.get("error") or "Unknown error"
+                        print(f"Server error: {msg}")
+                        return
+                    elif data0.get("type") == "room_assignment":
+                        self.room_id = data0.get("room_id")
+                        self.connection_status = f"Connected to room {self.room_id}"
+                        print(f"Assigned to room: {self.room_id}")
+                    else:
+                        # Not a control message; stash as last_data for game loop
+                        self.last_data = data0
+                except Exception:
+                    pass
                 
                 # Start game tasks
                 input_task = asyncio.create_task(self.handle_input(websocket))
@@ -681,6 +713,25 @@ class SimpleGameClient:
                     async with websockets.connect(connect_url, open_timeout=5) as websocket:
                         self.current_player_id = id(websocket)
                         print(f"Connected to server!")
+                        try:
+                            await websocket.send(json.dumps({"type": "hello", "action": action, "room": token}))
+                        except Exception:
+                            pass
+                        try:
+                            init_msg = await asyncio.wait_for(websocket.recv(), timeout=5)
+                            data0 = json.loads(init_msg)
+                            if (data0.get("type") == "error") or (isinstance(data0, dict) and "error" in data0):
+                                msg = data0.get("message") or data0.get("error") or "Unknown error"
+                                print(f"Server error: {msg}")
+                                return
+                            elif data0.get("type") == "room_assignment":
+                                self.room_id = data0.get("room_id")
+                                self.connection_status = f"Connected to room {self.room_id}"
+                                print(f"Assigned to room: {self.room_id}")
+                            else:
+                                self.last_data = data0
+                        except Exception:
+                            pass
                         input_task = asyncio.create_task(self.handle_input(websocket))
                         game_task = asyncio.create_task(self.game_loop(websocket))
                         done, pending = await asyncio.wait([input_task, game_task], return_when=asyncio.FIRST_COMPLETED)

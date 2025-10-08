@@ -49,7 +49,9 @@ class GameRoom:
         self.room_id = room_id
         self.players = {}  # websocket -> player data
         self.clients = set()
-        self.maze = copy.deepcopy(self.ORIGINAL_MAZE)
+        # Deterministic per-room maze seed so everyone in the room sees the same grid
+        self._maze_seed = int(abs(hash(room_id))) & 0xFFFFFFFF
+        self.maze = self._generate_maze(self._maze_seed)
         # Track tile visit counts for exploration bias (helps ghosts roam the grid)
         self.visit_counts = [
             [0 for _ in range(self.COLS)] for _ in range(self.ROWS)]
@@ -64,8 +66,56 @@ class GameRoom:
         self.CHASE_STEPS = 7 * 20     # ~7 seconds at 20 FPS
         self.SCATTER_STEPS = 5 * 20   # ~5 seconds at 20 FPS
 
+    def _generate_maze(self, seed: int):
+        """Generate a random, solvable maze for this room using a deterministic seed.
+        - Walls = 1, empty path = 0, pellets = 2, power pellets = 3
+        - Guarantees open spawn tiles at (1,1) and (17,13)
+        - Adds a horizontal wrap tunnel on the middle row if possible
+        """
+        rnd = random.Random(seed)
+        rows, cols = self.ROWS, self.COLS
+        # Start with all walls
+        grid = [[1 for _ in range(cols)] for _ in range(rows)]
+        # Carve passages on odd coordinates using DFS
+        def carve(x, y):
+            dirs = [(2,0), (-2,0), (0,2), (0,-2)]
+            rnd.shuffle(dirs)
+            for dx, dy in dirs:
+                nx, ny = x + dx, y + dy
+                if 1 <= nx < cols-1 and 1 <= ny < rows-1 and grid[ny][nx] == 1:
+                    grid[y + dy//2][x + dx//2] = 0
+                    grid[ny][nx] = 0
+                    carve(nx, ny)
+        # Pick a random odd start
+        sx = rnd.randrange(1, cols-1, 2)
+        sy = rnd.randrange(1, rows-1, 2)
+        grid[sy][sx] = 0
+        carve(sx, sy)
+        # Ensure spawn tiles are open
+        for (sx, sy) in [(1,1), (cols-2, rows-2)]:
+            grid[sy][sx] = 0
+        # Create wrap tunnel on middle row if possible
+        mid = rows // 2
+        grid[mid][0] = 0
+        grid[mid][cols-1] = 0
+        # Place pellets on open tiles; sprinkle a few power pellets
+        for y in range(rows):
+            for x in range(cols):
+                if grid[y][x] == 0:
+                    grid[y][x] = 2  # regular pellet
+        # Keep spawn tiles empty (no pellets) for clarity
+        grid[1][1] = 0
+        grid[rows-2][cols-2] = 0
+        # Power pellets: choose up to 4 far-apart corners if open
+        candidates = [(1,1), (1,rows-2), (cols-2,1), (cols-2,rows-2)]
+        rnd.shuffle(candidates)
+        for i, (x,y) in enumerate(candidates[:4]):
+            if grid[y][x] != 1:
+                grid[y][x] = 3
+        return grid
+
     def _initialize_ghosts(self):
-        """Initialize ghosts for this room"""
+        """Initialize ghosts for this room (ensure walkable spawns and initial direction)."""
         class Ghost:
             def __init__(self, x, y, behavior, color):
                 self.x = float(x)
@@ -81,12 +131,15 @@ class GameRoom:
                 self.home_y = y
                 self.path = deque()
                 self.stuck_counter = 0
-                self.last_positions = deque(maxlen=4)
+                self.last_positions = deque(maxlen=8)
+                self.last_grid = deque(maxlen=6)
+                self.last_choice_tick = 0
                 self.behavior_change_timer = 0
                 self.current_behavior = behavior
                 self.randomness_factor = random.uniform(0.3, 0.8)
                 self.change_interval = random.randint(
                     10, 40)  # more frequent direction changes
+                self.prev_tile = None
 
             def snap_to_grid(self):
                 grid_x = round(self.x)
@@ -99,22 +152,29 @@ class GameRoom:
 
         import random
         ghosts = [
-            Ghost(9 + random.uniform(-0.2, 0.2), 7 +
-                  random.uniform(-0.2, 0.2), "aggressive", "red"),
-            Ghost(8 + random.uniform(-0.2, 0.2), 9 +
-                  random.uniform(-0.2, 0.2), "patrol", "orange"),
-            Ghost(10 + random.uniform(-0.2, 0.2), 9 +
-                  random.uniform(-0.2, 0.2), "ambush", "purple"),
-            Ghost(9 + random.uniform(-0.2, 0.2), 8 +
-                  random.uniform(-0.2, 0.2), "random", "green")
+            Ghost(9 + random.uniform(-0.2, 0.2), 7 + random.uniform(-0.2, 0.2), "aggressive", "red"),
+            Ghost(8 + random.uniform(-0.2, 0.2), 9 + random.uniform(-0.2, 0.2), "patrol", "orange"),
+            Ghost(10 + random.uniform(-0.2, 0.2), 9 + random.uniform(-0.2, 0.2), "ambush", "purple"),
+            Ghost(9 + random.uniform(-0.2, 0.2), 8 + random.uniform(-0.2, 0.2), "random", "green")
         ]
 
         # Initialize ghosts with proper starting directions and scatter corners
         for i, ghost in enumerate(ghosts):
+            # Ensure spawn is walkable; move to nearest path tile if needed
+            gx, gy = int(round(ghost.x)), int(round(ghost.y))
+            nearest = self._nearest_walkable(gx, gy, max_radius=6)
+            if nearest:
+                nx, ny = nearest
+                ghost.x, ghost.y = float(nx), float(ny)
+                ghost.home_x, ghost.home_y = float(nx), float(ny)
             # right, left, down, up
             directions = [(1, 0), (-1, 0), (0, 1), (0, -1)]
             ghost.dx, ghost.dy = directions[i % 4]
-            ghost.mode_timer = i * 10  # Stagger their behavior updates
+            # If initial direction is blocked, pick a valid one
+            valids = self._get_valid_directions_simple(int(round(ghost.x)), int(round(ghost.y)))
+            if valids:
+                ghost.dx, ghost.dy = random.choice(valids)
+            ghost.mode_timer = i * 10  # Stagger behavior updates
             # Scatter targets (corners)
             top_left = (1, 1)
             top_right = (self.COLS - 2, 1)
@@ -315,10 +375,16 @@ class GameRoom:
                     self.visit_counts[vy][vx] = min(
                         self.visit_counts[vy][vx] + 1, 1_000_000)
                 self._choose_ghost_direction(ghost, frightened)
+                ghost.prev_tile = (vx, vy)
 
-            # Move along current direction
-            new_x = ghost.x + ghost.dx * self.GHOST_SPEED
-            new_y = ghost.y + ghost.dy * self.GHOST_SPEED
+            # Move along current direction with mode-based speed tuning
+            speed = self.GHOST_SPEED
+            if frightened:
+                speed = max(0.15, self.GHOST_SPEED * 0.85)
+            elif self.mode == "chase":
+                speed = min(0.28, self.GHOST_SPEED * 1.1)
+            new_x = ghost.x + ghost.dx * speed
+            new_y = ghost.y + ghost.dy * speed
 
             # Horizontal tunnel wrap if open
             gy = int(round(ghost.y))
@@ -330,16 +396,62 @@ class GameRoom:
                 if right_open and ghost.dx > 0 and new_x >= self.COLS - 0.4:
                     new_x = 0.6
 
+            # If ghost has no direction (e.g., after respawn), choose one now
+            if ghost.dx == 0 and ghost.dy == 0:
+                self._choose_ghost_direction(ghost, frightened, force=True)
+                # Recompute tentative movement with picked direction
+                new_x = ghost.x + ghost.dx * speed
+                new_y = ghost.y + ghost.dy * speed
+
             # Apply movement if valid, else force a new direction (allow reverse as last resort)
             if self.can_move(new_x, new_y):
                 ghost.x, ghost.y = new_x, new_y
             else:
                 # pick new direction immediately
                 self._choose_ghost_direction(ghost, frightened, force=True)
-                new_x2 = ghost.x + ghost.dx * self.GHOST_SPEED
-                new_y2 = ghost.y + ghost.dy * self.GHOST_SPEED
+                new_x2 = ghost.x + ghost.dx * speed
+                new_y2 = ghost.y + ghost.dy * speed
                 if self.can_move(new_x2, new_y2):
                     ghost.x, ghost.y = new_x2, new_y2
+                else:
+                    # Strong fallback: snap to tile center and choose any valid non-wall direction
+                    cx2, cy2 = int(round(ghost.x)), int(round(ghost.y))
+                    ghost.x, ghost.y = float(cx2), float(cy2)
+                    valids = self._get_valid_directions_simple(cx2, cy2)
+                    if valids:
+                        choice = random.choice(valids)
+                        ghost.dx, ghost.dy = choice
+                        new_x3 = ghost.x + ghost.dx * speed
+                        new_y3 = ghost.y + ghost.dy * speed
+                        if self.can_move(new_x3, new_y3):
+                            ghost.x, ghost.y = new_x3, new_y3
+
+            # Track grid transitions to fight oscillations and stuck
+            gx2, gy2 = int(round(ghost.x)), int(round(ghost.y))
+            ghost.last_grid.append((gx2, gy2))
+
+            # Anti-stuck: if ghost barely moved for a while, randomize direction
+            ghost.last_positions.append((round(ghost.x,2), round(ghost.y,2)))
+            if len(ghost.last_positions) >= ghost.last_positions.maxlen:
+                if len(set(ghost.last_positions)) <= 2:  # almost stationary
+                    cx3, cy3 = int(round(ghost.x)), int(round(ghost.y))
+                    valids = self._get_valid_directions_simple(cx3, cy3)
+                    if valids:
+                        choice = random.choice(valids)
+                        if choice == (-ghost.dx, -ghost.dy) and len(valids) > 1:
+                            choice = random.choice([d for d in valids if d != (-ghost.dx, -ghost.dy)])
+                        ghost.dx, ghost.dy = choice
+                        # Nudge movement after choosing to break inertia
+                        nux = float(cx3) + ghost.dx * speed
+                        nuy = float(cy3) + ghost.dy * speed
+                        if self.can_move(nux, nuy):
+                            ghost.x, ghost.y = nux, nuy
+                        ghost.last_positions.clear()
+
+            # Periodic re-evaluation: if going straight too long in chase, try a turn at intersections
+            if self.mode == "chase" and (self.game_tick - getattr(ghost, 'last_choice_tick', 0)) > 40:
+                if self._at_tile_center(ghost.x, ghost.y):
+                    self._choose_ghost_direction(ghost, frightened, force=False)
 
     def _update_ghost_behavior(self, ghost):
         """Deprecated: direction choice handled in _choose_ghost_direction"""
@@ -511,52 +623,67 @@ class GameRoom:
         non_reverse = [d for d in valid_dirs if d != reverse]
         candidates = non_reverse or valid_dirs
 
-        # Determine a target tile and plan via BFS for better roaming
+        # Determine a target tile and plan via BFS
         tx, ty = self._ghost_target_tile(ghost, frightened)
         tx = int(max(0, min(self.COLS - 1, tx)))
         ty = int(max(0, min(self.ROWS - 1, ty)))
         step = self._bfs_next_step(cx, cy, tx, ty)
 
-        # At intersections, prefer less-visited tiles to encourage roaming; keep some randomness
-        is_intersection = len(candidates) >= 3 or (
-            len(candidates) == 2 and candidates[0] != (-candidates[1][0], -candidates[1][1]))
-        if is_intersection:
-            # Exploration bias stronger in scatter mode; milder in chase
-            explore_rand = 0.2 if self.mode == "chase" else 0.6
-            if random.random() < explore_rand:
-                # Pick direction that leads to the least-visited neighbor tile
-                best = []
-                best_vis = None
+        # Oscillation breaker: avoid going straight back to the previous grid tile when we already did that
+        prev_tile = ghost.prev_tile
+        oscillation_penalty = {}
+        if prev_tile is not None and len(ghost.last_grid) >= 2:
+            # If last two grid positions were A,B then we are at B; discourage going back to A unless forced
+            last = ghost.last_grid[-1]
+            prev = ghost.last_grid[-2]
+            if last == (cx, cy) and prev == prev_tile:
                 for dx, dy in candidates:
                     nx, ny = cx + dx, cy + dy
-                    vis = self.visit_counts[ny][nx] if 0 <= ny < self.ROWS and 0 <= nx < self.COLS else 0
-                    if best_vis is None or vis < best_vis:
-                        best = [(dx, dy)]
-                        best_vis = vis
-                    elif vis == best_vis:
-                        best.append((dx, dy))
-                # Prefer BFS step if it matches one of the least-visited options
-                choice_pool = best
-                if step is not None and step in best:
-                    choice_pool = [step]
-                choice = random.choice(choice_pool)
-                if not force and choice == reverse and len(candidates) > 1:
-                    alt = [d for d in choice_pool if d != reverse] or [
-                        d for d in candidates if d != reverse]
-                    choice = random.choice(alt)
-                ghost.dx, ghost.dy = choice
-                return
+                    if (nx, ny) == prev_tile:
+                        oscillation_penalty[(dx, dy)] = 1000  # very high to discourage
 
-        # Add small randomness to avoid repetitive patterns, especially when frightened
-        if is_intersection and random.random() < (0.15 if not frightened else 0.35):
+        # At intersections, compute a score combining exploration (visit counts), BFS step preference, and oscillation penalty
+        is_intersection = len(candidates) >= 3 or (
+            len(candidates) == 2 and candidates[0] != (-candidates[1][0], -candidates[1][1]))
+        if is_intersection or force:
+            best_score = None
+            best_dirs = []
+            for dx, dy in candidates:
+                nx, ny = cx + dx, cy + dy
+                vis = self.visit_counts[ny][nx] if 0 <= ny < self.ROWS and 0 <= nx < self.COLS else 0
+                score = vis
+                # Prefer BFS step strongly
+                if step is not None and (dx, dy) == step:
+                    score -= 2
+                # Penalty for oscillation
+                score += oscillation_penalty.get((dx, dy), 0)
+                # Mild randomness to diversify
+                score += random.uniform(0, 0.25)
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_dirs = [(dx, dy)]
+                elif abs(score - best_score) < 1e-6:
+                    best_dirs.append((dx, dy))
+            choice = random.choice(best_dirs)
+            if not force and choice == reverse and len(candidates) > 1:
+                alt = [d for d in best_dirs if d != reverse] or [d for d in candidates if d != reverse]
+                choice = random.choice(alt)
+            ghost.dx, ghost.dy = choice
+            ghost.last_choice_tick = self.game_tick
+            return
+
+        # Add small randomness to avoid repetitive patterns when not at intersections
+        if random.random() < (0.10 if not frightened else 0.25):
             choice = random.choice(candidates)
             if not force and choice == reverse and len(candidates) > 1:
                 choice = random.choice([d for d in candidates if d != reverse])
             ghost.dx, ghost.dy = choice
+            ghost.last_choice_tick = self.game_tick
             return
 
         if step is not None and ((step in candidates) or force):
             ghost.dx, ghost.dy = step
+            ghost.last_choice_tick = self.game_tick
             return
 
         # Fallback: choose the direction that gets closer to target (ties random)
@@ -572,6 +699,7 @@ class GameRoom:
                 best_choices.append((dx, dy))
         if best_choices:
             ghost.dx, ghost.dy = random.choice(best_choices)
+            ghost.last_choice_tick = self.game_tick
 
     def _distance(self, x1, y1, x2, y2):
         """Calculate distance between two points"""
@@ -579,8 +707,8 @@ class GameRoom:
 
     async def _reset_room(self):
         """Reset the entire room after victory or on demand"""
-        # Reset maze and game tick
-        self.maze = copy.deepcopy(self.ORIGINAL_MAZE)
+        # Reset maze and game tick (regenerate using the same seed for this room)
+        self.maze = self._generate_maze(self._maze_seed)
         self.game_tick = 0
         self.mode = "scatter"
         self.mode_timer = 0
@@ -615,8 +743,14 @@ class GameRoom:
                 if self._distance(px, py, gx, gy) < 0.8:
                     if power > 0:
                         player["score"] += 200
-                        # Reset ghost to home
-                        ghost.x, ghost.y = ghost.home_x, ghost.home_y
+                        # Reset ghost to home (nearest walkable) and clear direction; will pick next tick
+                        nearest = self._nearest_walkable(int(round(ghost.home_x)), int(round(ghost.home_y)))
+                        if nearest:
+                            gx, gy = nearest
+                            ghost.x, ghost.y = float(gx), float(gy)
+                            ghost.home_x, ghost.home_y = float(gx), float(gy)
+                        else:
+                            ghost.x, ghost.y = ghost.home_x, ghost.home_y
                         ghost.dx, ghost.dy = 0, 0
                         ghost.path.clear()
                         ghost.mode_timer = 0
@@ -651,8 +785,8 @@ class GameRoom:
             player["direction"] = None
             player["keys"] = set()
 
-            # Reset the maze for this room
-            self.maze = copy.deepcopy(self.ORIGINAL_MAZE)
+            # Reset the maze for this room (preserve per-room seed)
+            self.maze = self._generate_maze(self._maze_seed)
 
     async def _broadcast_game_state(self):
         """Broadcast game state to all clients in this room"""

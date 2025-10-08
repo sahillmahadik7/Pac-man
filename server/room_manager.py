@@ -2,6 +2,7 @@
 import asyncio
 import time
 import uuid
+import os
 import websockets
 from typing import Dict, Optional, Set
 from .game_room import GameRoom
@@ -14,6 +15,10 @@ class RoomManager:
         self.player_to_room: Dict[int, str] = {}  # player_id -> room_id
         self.cleanup_interval = 60  # seconds
         self._cleanup_task = None
+        # Matchmaking policy:
+        # - "fill": default behavior (fill partially full rooms before creating new)
+        # - "solo": always create a fresh room for auto-assigned players
+        self.matchmaking_policy = os.getenv("PACMAN_MATCHMAKING", "solo").lower().strip() or "solo"
         
     async def start(self):
         """Start the room manager"""
@@ -32,14 +37,31 @@ class RoomManager:
         print("Room Manager stopped")
     
     async def assign_player_to_room(self, websocket) -> Optional[str]:
-        """Assign a player to an available room, creating a new one if necessary"""
+        """Assign a player to a room.
+        - If PACMAN_MATCHMAKING=solo: always create a fresh room per auto-assigned player
+        - Else (default fill): use first non-full room, create new if none
+        """
         player_id = id(websocket)
         
         # Check if player is already in a room
         if player_id in self.player_to_room:
             return self.player_to_room[player_id]
         
-        # Find an available room (not full)
+        # Solo mode: always create a new room (no forced pairing)
+        if self.matchmaking_policy == "solo":
+            room_id = str(uuid.uuid4())[:8]
+            new_room = GameRoom(room_id)
+            self.rooms[room_id] = new_room
+            print(f"[MM solo] Created new room: {room_id}")
+            success = await new_room.add_player(websocket)
+            if success:
+                self.player_to_room[player_id] = room_id
+                print(f"Player {player_id} assigned to room {room_id}")
+                return room_id
+            print("[MM solo] add_player failed unexpectedly")
+            return None
+        
+        # Fill mode: find an available room (not full)
         available_room = None
         for room in self.rooms.values():
             if not room.is_full():
@@ -63,9 +85,11 @@ class RoomManager:
         
         return None
 
-    async def add_player_to_specific_room(self, websocket, room_id: str, create_if_missing: bool = True) -> Optional[str]:
-        """Add a player to a specific room by ID. Optionally create if missing.
-        Returns room_id on success, None on failure (e.g., room full or not found and create disabled).
+    async def add_player_to_specific_room(self, websocket, room_id: str, create_if_missing: bool = True, force_new: bool = False) -> Optional[str]:
+        """Add a player to a specific room by ID.
+        - If force_new=True (used for action=create): always create a brand new room ID if the requested one is already in use.
+        - If create_if_missing=True: create the requested ID if it doesn't exist.
+        Returns effective room_id on success, None on failure.
         """
         player_id = id(websocket)
         
@@ -73,6 +97,26 @@ class RoomManager:
         if player_id in self.player_to_room:
             return self.player_to_room[player_id]
         
+        # If the caller wants a brand new room regardless of existing occupancy
+        if force_new:
+            effective_id = room_id or str(uuid.uuid4())[:8]
+            # If requested ID is already taken (even if not full), generate a unique variant
+            if effective_id in self.rooms:
+                suffix = str(uuid.uuid4())[:4]
+                effective_id = f"{effective_id}-{suffix}"
+            room = GameRoom(effective_id)
+            self.rooms[effective_id] = room
+            print(f"[MM force_new] Created room: {effective_id}")
+            success = await room.add_player(websocket)
+            if success:
+                self.player_to_room[player_id] = room.room_id
+                print(f"[MM force_new] Player {player_id} joined room {room.room_id}")
+                print(f"[MM force_new] Room {room.room_id} now has {len(room.players)} players")
+                return room.room_id
+            print("[MM force_new] add_player failed unexpectedly")
+            return None
+        
+        # Default behavior: join if exists and not full; optionally create if missing
         room = self.rooms.get(room_id)
         if room is None and create_if_missing:
             room = GameRoom(room_id)

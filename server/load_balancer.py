@@ -6,6 +6,7 @@ import subprocess
 from typing import List, Optional
 from urllib.parse import urlparse, parse_qs
 import hashlib
+import json
 
 import websockets
 
@@ -48,50 +49,57 @@ class BackendPool:
         self.room_to_backend: dict = {}  # room_id -> Backend
 
     async def pick_backend(self) -> Optional[Backend]:
-        """Room-based selection: choose backend with least active rooms for new games"""
+        """Least-connections selection across available backends."""
         async with self._lock:
             now = asyncio.get_event_loop().time()
             candidates = [b for b in self.backends if b.is_available(now)]
             if not candidates:
                 return None
-            # Choose backend with least active rooms (games), not connections
-            chosen = min(candidates, key=lambda b: len(b.active_rooms))
+            # Choose backend with the fewest active connections (classic least-connections)
+            # Tie-breaker by last_active to avoid sticking to index 0 on cold start
+            chosen = min(candidates, key=lambda b: (b.active_connections, b.last_active))
             chosen.active_connections += 1
             chosen.last_active = now
             return chosen
 
-    async def pick_backend_for_token(self, token: str) -> Optional[Backend]:
-        """Room-based consistent selection: if room exists, use same server; if new room, use least loaded server.
+    async def pick_backend_for_token(self, token: str, is_create: Optional[bool] = None) -> Optional[Backend]:
+        """Sticky rooms + intent-aware selection.
+        - If room already mapped: route there (join/create).
+        - If creating: choose backend with the fewest active rooms and establish mapping.
+        - If joining and no mapping exists: return None (room not found at LB).
         """
         async with self._lock:
             now = asyncio.get_event_loop().time()
             available = [b for b in self.backends if b.is_available(now)]
-            if not available:
+            if not available and not self.backends:
                 return None
             
-            # Check if this room already exists on any backend
+            # Existing mapping
             existing_backend = self.room_to_backend.get(token)
             if existing_backend and existing_backend in available:
-                # Room exists, route to the same server
                 existing_backend.active_connections += 1
                 existing_backend.last_active = now
-                # Increment player count for this room
-                existing_backend.room_player_counts[token] = existing_backend.room_player_counts.get(token, 0) + 1
-                print(f"[LB] Room '{token}' exists on {existing_backend.url}, routing there (players: {existing_backend.room_player_counts[token]})")
+                if token in existing_backend.room_player_counts:
+                    existing_backend.room_player_counts[token] = existing_backend.room_player_counts.get(token, 0) + 1
+                print(f"[LB] Room '{token}' exists on {existing_backend.url}, routing there")
                 return existing_backend
             
-            # New room: select backend with least active rooms
-            candidate = min(available, key=lambda b: len(b.active_rooms))
-            candidate.active_connections += 1
-            candidate.last_active = now
+            # Create new room: choose backend with least active rooms
+            if is_create is True:
+                if not available:
+                    return None
+                candidate = min(available, key=lambda b: len(b.active_rooms))
+                candidate.active_connections += 1
+                candidate.last_active = now
+                self.room_to_backend[token] = candidate
+                candidate.active_rooms.add(token)
+                candidate.room_player_counts[token] = candidate.room_player_counts.get(token, 0) + 1
+                print(f"[LB] New room '{token}' assigned to {candidate.url} (rooms: {len(candidate.active_rooms)})")
+                return candidate
             
-            # Track this new room assignment
-            self.room_to_backend[token] = candidate
-            candidate.active_rooms.add(token)
-            candidate.room_player_counts[token] = 1  # First player joining
-            
-            print(f"[LB] New room '{token}' assigned to {candidate.url} (active rooms: {len(candidate.active_rooms)})")
-            return candidate
+            # Join requested but we have no mapping for this token
+            print(f"[LB] Join requested for unknown room '{token}'")
+            return None
 
     async def release_backend(self, backend: Backend):
         async with self._lock:
@@ -143,14 +151,57 @@ async def handle_client(websocket: websockets.WebSocketServerProtocol, path: Opt
         qs = parse_qs(parsed.query)
         token = (qs.get("room", [None])[0] or "").strip() or None
     
+    # Also parse 'action' if provided (for forwarding)
+    action = None
+    if req_path:
+        try:
+            parsed_tmp = urlparse(req_path)
+            qs_tmp = parse_qs(parsed_tmp.query)
+            action = (qs_tmp.get("action", [None])[0] or "").strip().lower() or None
+        except Exception:
+            action = None
+
+    # Peek the first client frame to learn token/action if not present in URL
+    first_msg = None
+    if not token or not action:
+        try:
+            raw = await asyncio.wait_for(websocket.recv(), timeout=0.8)
+            first_msg = raw
+            try:
+                data0 = None
+                if isinstance(raw, (bytes, bytearray)):
+                    try:
+                        data0 = json.loads(raw.decode("utf-8", errors="ignore"))
+                    except Exception:
+                        data0 = None
+                else:
+                    data0 = json.loads(raw)
+                if isinstance(data0, dict) and data0.get("type") == "hello":
+                    if not token:
+                        token = (data0.get("room") or "").strip() or None
+                    if not action:
+                        action = (data0.get("action") or "").strip().lower() or None
+                    try:
+                        print(f"[LB] learned from frame: action='{action or '-'}', token='{token or '-'}'")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     if token:
-        backend: Optional[Backend] = await pool.pick_backend_for_token(token)
+        is_create_flag = (action == "create") if action else None
+        backend: Optional[Backend] = await pool.pick_backend_for_token(token, is_create=is_create_flag)
     else:
         backend: Optional[Backend] = await pool.pick_backend()
     if not backend:
-        # No backend available; inform client
+        # No backend available or unknown room token
         try:
-            await websocket.send('{"error": "No backend available. Please try again later."}')
+            if token and action == "join":
+                await websocket.send('{"type": "error", "message": "Room not found."}')
+            else:
+                await websocket.send('{"type": "error", "message": "No backend available. Please try again later."}')
         finally:
             await websocket.close()
         return
@@ -163,7 +214,7 @@ async def handle_client(websocket: websockets.WebSocketServerProtocol, path: Opt
     if token and token not in pool.room_to_backend:  # New room
         if available and all(len(b.active_rooms) >= max_rooms_per_server for b in available):
             try:
-                await websocket.send('{"error": "All servers are hosting maximum rooms. Please try again later."}')
+                await websocket.send('{"type": "error", "message": "All servers are hosting maximum rooms. Please try again later."}')
             finally:
                 await websocket.close()
             return
@@ -186,8 +237,16 @@ async def handle_client(websocket: websockets.WebSocketServerProtocol, path: Opt
                     dest_url = f"{backend.url}{req_path}"
                 else:
                     dest_url = f"{backend.url}/{req_path}"
+            # Connect to backend. For maximum compatibility across websockets versions,
+            # avoid passing extra headers here.
             async with websockets.connect(dest_url, open_timeout=5) as backend_ws:
                 backend.on_success()
+                # If we consumed a first client frame (e.g., hello), forward it to the backend first
+                if first_msg is not None:
+                    try:
+                        await backend_ws.send(first_msg)
+                    except Exception:
+                        pass
                 await bidirectional_proxy(websocket, backend_ws)
         except Exception as e:
             # Mark backend failure and close client
@@ -197,7 +256,7 @@ async def handle_client(websocket: websockets.WebSocketServerProtocol, path: Opt
             except Exception:
                 pass
             try:
-                await websocket.send('{"error": "Selected backend became unavailable. Please reconnect."}')
+                await websocket.send('{"type": "error", "message": "Selected backend became unavailable. Please reconnect."}')
             finally:
                 await websocket.close()
     finally:
